@@ -25,6 +25,7 @@ const REQUIRED_KEYS = [
 	'awg.suspendCheckHint',
 	'awg.suspendedQuota',
 	'awg.suspended',
+	'awg.transferCumulative',
 	'users.active',
 	'users.pending',
 	'users.disabledLabel',
