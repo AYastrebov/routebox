@@ -526,3 +526,46 @@ func TestSingboxSweepStatsErrorLogsOnce(t *testing.T) {
 		t.Fatalf("a failure after a recovery must log again, got %d occurrences:\n%s", n, buf.String())
 	}
 }
+
+// Lowering a quota below what is spent while the AWG server is DISABLED must
+// still answer 200: the store has taken the new limit by design (it is not
+// rolled back), and there is no interface to take the peer off — `awg set …
+// remove` would only fail and turn a saved change into a 500. The peer is stored
+// as out of service, which is all the next Enable needs: it renders the conf
+// from peerLines, which skips it.
+func TestSetPeerLimitsLoweringQuotaWithInterfaceDownIsNotAnError(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeRunner()
+	m := newTestManager(t, f)
+	seedConf(t, m)
+	m.store.now = func() int64 { return 1000 }
+	seedUsagePeer(t, m, Peer{
+		PublicKey: validPub, PresharedKey: "psk", Address: "10.10.0.2/32", Name: "bob",
+		QuotaBytes: 4096, UsedRx: 500, UsedTx: 500,
+	})
+	// A missing interface fails BOTH the probe and any write against it — the
+	// second one is what used to answer 500 on a change the store had kept.
+	down := errors.New("Unable to access interface: No such device")
+	f.errsContains["awg show"] = down
+	f.errsContains["awg set awg-rb0 peer"] = down
+
+	if err := m.SetPeerLimits(ctx, validPub, nil, i64(100)); err != nil {
+		t.Fatalf("SetPeerLimits must succeed with the interface down: %v", err)
+	}
+	got, _ := m.store.Get(validPub)
+	if got.QuotaBytes != 100 {
+		t.Fatalf("the new quota must be stored: %+v", got)
+	}
+	if got.Suspension(1000) != quota.ReasonQuota {
+		t.Fatalf("the peer must be stored out of service: %+v", got)
+	}
+	if f.sawContains("peer " + validPub + " remove") {
+		t.Fatalf("nothing may be removed from an interface that is not there; calls=%v", f.calls)
+	}
+	// And the next Enable will not put it back: it is off the rendered conf.
+	for _, pl := range m.peerLines() {
+		if pl.PublicKey == validPub {
+			t.Fatal("a suspended peer must not be rendered into the conf")
+		}
+	}
+}

@@ -1076,7 +1076,8 @@ func (m *Manager) ResetPeerUsage(ctx context.Context, pub string) error {
 //     interface (a crash, a manual `awg set`) — the sweep only ever removes.
 //   - newly out of service → suspend. A peer that was ALREADY suspended is left
 //     alone: it is off the interface, and a second removal would only turn a
-//     stored-quota edit into a live `awg set … remove` for no reason.
+//     stored-quota edit into a live `awg set … remove` for no reason. So is one
+//     whose interface is down: there is nothing to remove it from.
 //
 // A failed admit rolls the store back, because nothing heals a store that claims
 // limits the interface never got. A failed suspend does not: the peer is stored
@@ -1099,6 +1100,16 @@ func (m *Manager) applySuspensionChange(ctx context.Context, prev, next Peer) er
 	if next.Suspended(now) {
 		if prev.Suspended(now) {
 			return nil // already off the interface; the store now holds the new values
+		}
+		if _, err := m.iface_ShowPeers(ctx); err != nil {
+			// No interface to take the peer off: the AWG server is disabled, or
+			// awg-quick never came up. `awg set … remove` would fail here and turn
+			// an operator's saved limit change into a 500 while the store already
+			// holds it. Nothing has to be applied instead: the peer is stored as
+			// out of service, and the next Enable renders the conf from peerLines,
+			// which skips a suspended peer.
+			log.Printf("awg: peer %s is out of service (%s); nothing to apply, %s is down: %v", pub, next.Suspension(now), m.iface, err)
+			return nil
 		}
 		if err := m.suspend(ctx, pub); err != nil {
 			log.Printf("awg: peer %s is out of service (%s) but could not be removed from %s: %v", pub, next.Suspension(now), m.iface, err)
