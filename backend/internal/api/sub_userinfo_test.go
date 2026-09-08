@@ -106,9 +106,51 @@ func TestSub_UserinfoHeader_TotalIsQuota(t *testing.T) {
 	}
 }
 
+// TestSub_UserinfoHeader_UsesQuotaCountersWhenQuotaSet pins the pairing the
+// header's three numbers only make sense as: with a quota set, upload/download
+// are the quota's own counters (since the last reset), NOT the lifetime SQLite
+// totals. Seeded so the two disagree — a reset user whose lifetime traffic is
+// large — because that is exactly when a client would otherwise draw a full bar
+// for a user in service.
+func TestSub_UserinfoHeader_UsesQuotaCountersWhenQuotaSet(t *testing.T) {
+	h, um := newSubHandler(t, "vpn.example.com")
+
+	u := um.List()[0]
+	u.QuotaBytes = 5000
+	if err := um.Put(&u); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := um.AddUsage(map[string]struct{ Up, Down int64 }{
+		u.Name: {Up: 10, Down: 20},
+	}); err != nil {
+		t.Fatalf("AddUsage: %v", err)
+	}
+
+	// A lifetime history far bigger than the post-reset counters.
+	store, err := traffic.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertUser(60, u.Name, 900000, 800000); err != nil {
+		t.Fatalf("UpsertUser: %v", err)
+	}
+	h.traffic = store
+
+	rec := serveSub(h, u.Token, "203.0.113.15")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	want := "upload=10; download=20; total=5000; expire=0"
+	if got := rec.Header().Get("Subscription-Userinfo"); got != want {
+		t.Errorf("Subscription-Userinfo = %q, want %q", got, want)
+	}
+}
+
 // TestSub_UserinfoHeader_QuotaExhausted_EmptyBodyStillReportsTotal proves the
-// suspended (quota) path emits the same total, so a client shows "0 left"
-// instead of "unlimited" while the subscription is empty.
+// suspended (quota) path emits the same total alongside the counters that spent
+// it, so a client shows a full bar rather than "nothing used, no limit" while
+// the subscription body is empty.
 func TestSub_UserinfoHeader_QuotaExhausted_EmptyBodyStillReportsTotal(t *testing.T) {
 	h, um := newSubHandler(t, "vpn.example.com")
 
@@ -132,7 +174,7 @@ func TestSub_UserinfoHeader_QuotaExhausted_EmptyBodyStillReportsTotal(t *testing
 	if body := rec.Body.String(); body != "" {
 		t.Errorf("quota-exhausted user must get an empty body, got %q", body)
 	}
-	want := "upload=0; download=0; total=1000; expire=0"
+	want := "upload=400; download=600; total=1000; expire=0"
 	if got := rec.Header().Get("Subscription-Userinfo"); got != want {
 		t.Errorf("Subscription-Userinfo = %q, want %q", got, want)
 	}
