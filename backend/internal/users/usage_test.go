@@ -183,3 +183,90 @@ token_disabled = false
 		t.Fatalf("legacy user with zero quota must stay active")
 	}
 }
+
+// TestPutPreservesCounters is the lost-update guard: the edit path is
+// Get → mutate a copy → Put, and Put replaces the record wholesale, so an
+// AddUsage landing between the Get and the Put would otherwise be thrown away.
+// Only AddUsage/ResetUsage may write counters.
+func TestPutPreservesCounters(t *testing.T) {
+	m, _ := seedUsageManager(t)
+
+	// The editor reads the user...
+	editing, _ := m.Get("u-alice")
+	// ...the sampler credits traffic in between...
+	if _, err := m.AddUsage(map[string]struct{ Up, Down int64 }{"alice": {Up: 30, Down: 70}}); err != nil {
+		t.Fatalf("AddUsage: %v", err)
+	}
+	if err := m.ResetUsage("u-bob", 111); err != nil {
+		t.Fatalf("ResetUsage: %v", err)
+	}
+	// ...and the editor saves its stale copy (which also carries stale zeros).
+	editing.QuotaBytes = 5000
+	editing.UsedRx, editing.UsedTx, editing.UsedResetAt = 0, 0, 0
+	if err := m.Put(&editing); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	got, _ := m.Get("u-alice")
+	if got.QuotaBytes != 5000 {
+		t.Fatalf("Put must still write the editable fields, quota = %d", got.QuotaBytes)
+	}
+	if got.UsedTx != 30 || got.UsedRx != 70 {
+		t.Fatalf("Put discarded concurrent usage: tx %d / rx %d, want 30 / 70", got.UsedTx, got.UsedRx)
+	}
+
+	// The same holds for UsedResetAt.
+	bob, _ := m.Get("u-bob")
+	bob.UsedResetAt = 0
+	if err := m.Put(&bob); err != nil {
+		t.Fatalf("Put bob: %v", err)
+	}
+	if got, _ := m.Get("u-bob"); got.UsedResetAt != 111 {
+		t.Fatalf("Put clobbered UsedResetAt: %d, want 111", got.UsedResetAt)
+	}
+
+	// A brand-new user keeps whatever the caller supplied (nothing to preserve).
+	fresh := &PanelUser{ID: "u-new", Name: "new", Enabled: true, UsedRx: 5, UsedTx: 6, UsedResetAt: 7}
+	if err := m.Put(fresh); err != nil {
+		t.Fatalf("Put fresh: %v", err)
+	}
+	if got, _ := m.Get("u-new"); got.UsedRx != 5 || got.UsedTx != 6 || got.UsedResetAt != 7 {
+		t.Fatalf("a first Put must keep the supplied counters, got %+v", got)
+	}
+}
+
+// TestAddUsage_ReadOnlyKeepsCountersInMemory: on an unwritable users file the
+// quota must still be enforced. AddUsage keeps the accumulated counters in
+// memory (disk catches up on the next successful write) and returns the error
+// for the caller to log once — rolling back instead would mean an unwritable
+// install never blocks anyone.
+func TestAddUsage_ReadOnlyKeepsCountersInMemory(t *testing.T) {
+	path := unwritableUsersPath(t)
+	m := NewManager(path)
+	m.byID["u1"] = &PanelUser{ID: "u1", Name: "alice", Enabled: true, QuotaBytes: 100}
+
+	changed, err := m.AddUsage(map[string]struct{ Up, Down int64 }{"alice": {Up: 40, Down: 30}})
+	if err == nil {
+		t.Fatalf("AddUsage on a read-only file must report the failure")
+	}
+	if !changed {
+		t.Fatalf("AddUsage must report the in-memory change even when the write failed")
+	}
+	u, _ := m.Get("u1")
+	if u.UsedTx != 40 || u.UsedRx != 30 {
+		t.Fatalf("counters rolled back: tx %d / rx %d, want 40 / 30", u.UsedTx, u.UsedRx)
+	}
+
+	// A second tick keeps accumulating, so the quota is reached and enforced
+	// despite the file never being writable.
+	if _, err := m.AddUsage(map[string]struct{ Up, Down int64 }{"alice": {Up: 40, Down: 30}}); err == nil {
+		t.Fatalf("second AddUsage must also report the failure")
+	}
+	u, _ = m.Get("u1")
+	if u.UsedTx != 80 || u.UsedRx != 60 {
+		t.Fatalf("second tick lost: tx %d / rx %d, want 80 / 60", u.UsedTx, u.UsedRx)
+	}
+	if IsEffectivelyActive(u, 1000) {
+		t.Fatalf("a user over its quota must be suspended even on a read-only install")
+	}
+}

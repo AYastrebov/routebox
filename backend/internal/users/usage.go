@@ -15,9 +15,15 @@ import "fmt"
 //
 // Returns changed=false and writes nothing when the batch attributes zero bytes,
 // so the 30s ticker does not rewrite users.toml on an idle server (spec Q7: the
-// write is atomic and only on change). A write failure rolls the in-memory
-// counters back so memory never diverges from disk — the deltas of that one tick
-// are lost, which is the same "counters stay flat" behaviour a failed sample has.
+// write is atomic and only on change).
+//
+// A write failure KEEPS the in-memory counters and returns the error (with
+// changed=true). This is deliberately unlike Put: on a read-only install every
+// tick with traffic would fail, and rolling back each time would mean the quota
+// never fills and nobody is ever suspended there. Memory running ahead of disk
+// costs at most the un-persisted tail on the next restart; disk catches up on the
+// first successful write. The caller logs the failure once (first-failure-then-
+// silent, like the sampler's own gate) instead of every 30 seconds.
 func (m *Manager) AddUsage(deltas map[string]struct{ Up, Down int64 }) (bool, error) {
 	if len(deltas) == 0 {
 		return false, nil
@@ -25,11 +31,6 @@ func (m *Manager) AddUsage(deltas map[string]struct{ Up, Down int64 }) (bool, er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	type snapshot struct {
-		u      *PanelUser
-		rx, tx int64
-	}
-	var undo []snapshot
 	changed := false
 	for _, u := range m.byID {
 		var up, down int64
@@ -44,7 +45,6 @@ func (m *Manager) AddUsage(deltas map[string]struct{ Up, Down int64 }) (bool, er
 		if up <= 0 && down <= 0 {
 			continue
 		}
-		undo = append(undo, snapshot{u: u, rx: u.UsedRx, tx: u.UsedTx})
 		if up > 0 {
 			u.UsedTx += up
 		}
@@ -56,13 +56,8 @@ func (m *Manager) AddUsage(deltas map[string]struct{ Up, Down int64 }) (bool, er
 	if !changed {
 		return false, nil
 	}
-	if err := m.saveLocked(); err != nil {
-		for _, s := range undo {
-			s.u.UsedRx, s.u.UsedTx = s.rx, s.tx
-		}
-		return false, err
-	}
-	return true, nil
+	// Counters stay put on failure — see the doc comment.
+	return true, m.saveLocked()
 }
 
 // ResetUsage zeroes a user's accumulated counters and stamps UsedResetAt (unix

@@ -114,9 +114,15 @@ func TestSub_UserinfoHeader_QuotaExhausted_EmptyBodyStillReportsTotal(t *testing
 
 	u := um.List()[0]
 	u.QuotaBytes = 1000
-	u.UsedRx, u.UsedTx = 600, 400
 	if err := um.Put(&u); err != nil {
 		t.Fatal(err)
+	}
+	// Counters are written by the accounting path only — Put deliberately
+	// preserves them, so seeding them through Put would be a no-op.
+	if _, err := um.AddUsage(map[string]struct{ Up, Down int64 }{
+		u.Name: {Up: 400, Down: 600},
+	}); err != nil {
+		t.Fatalf("AddUsage: %v", err)
 	}
 
 	rec := serveSub(h, u.Token, "203.0.113.14")

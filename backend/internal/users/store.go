@@ -126,11 +126,23 @@ func (m *Manager) saveLocked() error {
 // Put inserts or replaces a user (storing a deep copy) and persists. If
 // persistence fails the in-memory state is rolled back to its prior value so
 // memory never diverges from disk.
+//
+// The traffic counters are NOT taken from u when the user already exists: they
+// are carried over from the stored record. Every edit path is
+// Get → mutate a copy → Put, so a sampler tick landing between the Get and the
+// Put would otherwise be silently discarded — and a discarded tick is a quota
+// that never fills. UsedRx/UsedTx/UsedResetAt are written by AddUsage and
+// ResetUsage alone; a first Put keeps whatever the caller supplied (there is
+// nothing to preserve).
 func (m *Manager) Put(u *PanelUser) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	prev, existed := m.byID[u.ID]
-	m.byID[u.ID] = cloneUser(u)
+	next := cloneUser(u)
+	if existed {
+		next.UsedRx, next.UsedTx, next.UsedResetAt = prev.UsedRx, prev.UsedTx, prev.UsedResetAt
+	}
+	m.byID[u.ID] = next
 	if err := m.saveLocked(); err != nil {
 		if existed {
 			m.byID[u.ID] = prev

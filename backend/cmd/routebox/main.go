@@ -412,14 +412,25 @@ func main() {
 		// The 30s expiry ticker below recomputes the reject set from the current
 		// list on every tick, so a user that just used up its quota is suspended
 		// within one tick without any extra plumbing here.
+		// A read-only users.toml fails EVERY tick that carries traffic (the
+		// counters stay in memory and the quota is still enforced), so the log is
+		// gated first-failure-then-silent, exactly like the sampler's own query
+		// gate — no spam every 30s. The closure runs only on the sampler
+		// goroutine, so the flag needs no lock.
+		usageWriteFailed := false
 		userSampler.OnDeltas = func(deltas map[string]traffic.UserDelta) {
 			byName := make(map[string]struct{ Up, Down int64 }, len(deltas))
 			for name, d := range deltas {
 				byName[name] = struct{ Up, Down int64 }{Up: d.Upload, Down: d.Download}
 			}
-			if _, err := usersMgr.AddUsage(byName); err != nil {
-				log.Printf("users: traffic accounting write failed: %v", err)
+			_, err := usersMgr.AddUsage(byName)
+			switch {
+			case err != nil && !usageWriteFailed:
+				log.Printf("users: traffic accounting cannot be persisted (quota still enforced in memory): %v", err)
+			case err == nil && usageWriteFailed:
+				log.Printf("users: traffic accounting persisted again")
 			}
+			usageWriteFailed = err != nil
 		}
 		go func() {
 			userSampler.Run(client, 30, 35, stopUserSampler)

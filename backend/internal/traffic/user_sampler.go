@@ -26,6 +26,13 @@ type UserSampler struct {
 	store    *Store
 	mu       sync.Mutex
 	lastSeen map[string]v2stats.Counters
+	// primed goes true on the FIRST successful snapshot, which is used only to
+	// establish the baseline and emits nothing. amnezia-box's counters are
+	// cumulative for the life of ITS process, which outlives RouteBox restarts
+	// (self-update, crash, systemctl restart): treating that first snapshot as a
+	// delta would re-add everything since sing-box start on top of the counters
+	// users.toml already holds and falsely block the user (spec Q7).
+	primed bool
 
 	// OnDeltas, when set, receives the SAME deltas the SQLite upserts get, right
 	// after them, keyed by inbound user name. It is how the panel-user quota
@@ -43,11 +50,21 @@ func NewUserSampler(store *Store) *UserSampler {
 }
 
 // computeUserDeltas diffs the new cumulative snapshot vs lastSeen, reset-safely,
-// and evicts users absent from the snapshot. Zero-delta users are omitted.
+// and evicts users absent from the snapshot. Zero-delta users are omitted. The
+// very first snapshot only primes the baseline (see UserSampler.primed).
 func (s *UserSampler) computeUserDeltas(cur map[string]v2stats.Counters) map[string]UserDelta {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := map[string]UserDelta{}
+	// First successful snapshot: baseline only, no deltas. A name that appears
+	// LATER is genuinely new to a running process and still counts in full.
+	if !s.primed {
+		s.primed = true
+		for name, c := range cur {
+			s.lastSeen[name] = c
+		}
+		return out
+	}
 	for name, c := range cur {
 		prev, ok := s.lastSeen[name]
 		var dUp, dDown int64

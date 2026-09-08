@@ -31,7 +31,8 @@ func (f *fakeUserQuerier) QueryUsersTimeout(time.Duration) (map[string]v2stats.C
 // TestSampleOnce_ErrorTickNoStateChange_RecoverRecordsDelta locks the log-gate
 // contract: an error tick mutates neither lastSeen nor the store and flips the gate
 // to "failed"; the next successful tick clears the gate and records the delta
-// against the established baseline (no panic, no negative).
+// against the established baseline (no panic, no negative). Tick 0 is the priming
+// snapshot, so it establishes the baseline and records nothing.
 func TestSampleOnce_ErrorTickNoStateChange_RecoverRecordsDelta(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
@@ -49,7 +50,7 @@ func TestSampleOnce_ErrorTickNoStateChange_RecoverRecordsDelta(t *testing.T) {
 		errs: []error{nil, errors.New("unavailable"), nil},
 	}
 
-	// tick 0: baseline established, full volume recorded.
+	// tick 0: baseline established (priming), nothing recorded.
 	if failed := s.sampleOnce(q, time.Second, false); failed {
 		t.Fatalf("tick0 success should leave gate open")
 	}
@@ -66,8 +67,8 @@ func TestSampleOnce_ErrorTickNoStateChange_RecoverRecordsDelta(t *testing.T) {
 		t.Fatalf("error tick mutated lastSeen: %+v != %+v", got, base)
 	}
 	up, down, _ := store.QueryUserTotals(0, time.Now().Unix()+60, "alice")
-	if up != 100 || down != 200 {
-		t.Fatalf("error tick mutated store: up/down = %d/%d, want 100/200", up, down)
+	if up != 0 || down != 0 {
+		t.Fatalf("nothing should be recorded yet: up/down = %d/%d, want 0/0", up, down)
 	}
 
 	// tick 2: recovery — gate clears, +50/+60 recorded against baseline.
@@ -75,16 +76,21 @@ func TestSampleOnce_ErrorTickNoStateChange_RecoverRecordsDelta(t *testing.T) {
 		t.Fatalf("recovery tick must clear gate (failed=false)")
 	}
 	up, down, _ = store.QueryUserTotals(0, time.Now().Unix()+60, "alice")
-	if up != 150 || down != 260 {
-		t.Fatalf("after recovery up/down = %d/%d, want 150/260 (100+50, 200+60)", up, down)
+	if up != 50 || down != 60 {
+		t.Fatalf("after recovery up/down = %d/%d, want 50/60 (delta vs the primed baseline)", up, down)
 	}
 }
 
-func TestUserDeltas_FirstSnapshotIsFullVolume(t *testing.T) {
+// TestUserDeltas_FirstSnapshotOnlyPrimes: sing-box counters outlive RouteBox, so
+// the first snapshot is a baseline, not a delta (spec Q7, amended).
+func TestUserDeltas_FirstSnapshotOnlyPrimes(t *testing.T) {
 	s := NewUserSampler(nil)
 	d := s.computeUserDeltas(map[string]v2stats.Counters{"alice": {Uplink: 100, Downlink: 200}})
-	if d["alice"].Upload != 100 || d["alice"].Download != 200 {
-		t.Fatalf("got %+v, want alice 100/200", d)
+	if len(d) != 0 {
+		t.Fatalf("got %+v, want no deltas from the priming snapshot", d)
+	}
+	if base := s.lastSeen["alice"]; base.Uplink != 100 || base.Downlink != 200 {
+		t.Fatalf("baseline = %+v, want 100/200", base)
 	}
 }
 
@@ -165,16 +171,17 @@ func TestSampleOnce_OnDeltasSink(t *testing.T) {
 	s.OnDeltas = func(d map[string]UserDelta) { got = append(got, d) }
 
 	q := &fakeUserQuerier{snaps: []map[string]v2stats.Counters{
-		{"alice": {Uplink: 10, Downlink: 20}},
-		{"alice": {Uplink: 15, Downlink: 20}},
+		{"alice": {Uplink: 0, Downlink: 0}},   // priming
+		{"alice": {Uplink: 10, Downlink: 20}}, // +10/+20
+		{"alice": {Uplink: 15, Downlink: 20}}, // +5/0
 		{"alice": {Uplink: 15, Downlink: 20}}, // no change → no call
 	}}
-	s.sampleOnce(q, time.Second, false)
-	s.sampleOnce(q, time.Second, false)
-	s.sampleOnce(q, time.Second, false)
+	for i := 0; i < 4; i++ {
+		s.sampleOnce(q, time.Second, false)
+	}
 
 	if len(got) != 2 {
-		t.Fatalf("sink called %d times, want 2 (zero-delta tick must not call): %v", len(got), got)
+		t.Fatalf("sink called %d times, want 2 (priming and zero-delta ticks must not call): %v", len(got), got)
 	}
 	if got[0]["alice"] != (UserDelta{Upload: 10, Download: 20}) {
 		t.Fatalf("first delta = %+v", got[0])
@@ -192,8 +199,12 @@ func TestSampleOnce_NilStore_StillFeedsSink(t *testing.T) {
 	s.OnDeltas = func(d map[string]UserDelta) { got = d }
 
 	q := &fakeUserQuerier{snaps: []map[string]v2stats.Counters{
-		{"bob": {Uplink: 3, Downlink: 4}},
+		{"bob": {Uplink: 1, Downlink: 1}}, // priming
+		{"bob": {Uplink: 4, Downlink: 5}}, // +3/+4
 	}}
+	if failed := s.sampleOnce(q, time.Second, false); failed {
+		t.Fatalf("nil store must not fail the tick")
+	}
 	if failed := s.sampleOnce(q, time.Second, false); failed {
 		t.Fatalf("nil store must not fail the tick")
 	}
@@ -214,6 +225,7 @@ func TestRun_NilStore_StillSamples(t *testing.T) {
 		}
 	}
 	q := &fakeUserQuerier{snaps: []map[string]v2stats.Counters{
+		{"carol": {Uplink: 0, Downlink: 0}}, // priming tick
 		{"carol": {Uplink: 1, Downlink: 2}},
 	}}
 	stop := make(chan struct{})
@@ -227,5 +239,79 @@ func TestRun_NilStore_StillSamples(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Run with a nil store never sampled")
+	}
+}
+
+// TestSampleOnce_FirstSnapshotOnlyPrimes is the anti-double-counting contract
+// (spec Q7, amended): amnezia-box keeps its cumulative counters across a RouteBox
+// restart, so the FIRST successful snapshot of a sampler's life must only prime
+// lastSeen — emitting its full value would add everything since sing-box start on
+// top of what users.toml already holds and falsely block the user. A name that
+// first appears in a LATER snapshot is genuinely new and still counts in full.
+func TestSampleOnce_FirstSnapshotOnlyPrimes(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+	s := NewUserSampler(store)
+
+	var got []map[string]UserDelta
+	s.OnDeltas = func(d map[string]UserDelta) { got = append(got, d) }
+
+	q := &fakeUserQuerier{snaps: []map[string]v2stats.Counters{
+		{"alice": {Uplink: 100, Downlink: 200}},                                  // priming only
+		{"alice": {Uplink: 110, Downlink: 200}, "bob": {Uplink: 7, Downlink: 8}}, // +10 / full bob
+	}}
+	s.sampleOnce(q, time.Second, false)
+	if len(got) != 0 {
+		t.Fatalf("first snapshot must emit no deltas, got %v", got)
+	}
+	if base := s.lastSeen["alice"]; base.Uplink != 100 || base.Downlink != 200 {
+		t.Fatalf("first snapshot must still prime lastSeen, got %+v", base)
+	}
+	// SQLite must not see the primed volume either.
+	up, down, err := store.QueryUserTotals(0, 1<<62, "alice")
+	if err != nil {
+		t.Fatalf("QueryUserTotals: %v", err)
+	}
+	if up != 0 || down != 0 {
+		t.Fatalf("primed snapshot leaked into SQLite: up=%d down=%d", up, down)
+	}
+
+	s.sampleOnce(q, time.Second, false)
+	if len(got) != 1 {
+		t.Fatalf("second snapshot should emit exactly one batch, got %v", got)
+	}
+	if got[0]["alice"] != (UserDelta{Upload: 10, Download: 0}) {
+		t.Fatalf("alice delta = %+v, want +10/0", got[0]["alice"])
+	}
+	if got[0]["bob"] != (UserDelta{Upload: 7, Download: 8}) {
+		t.Fatalf("a name first seen after priming must count in full, got %+v", got[0]["bob"])
+	}
+}
+
+// TestSampleOnce_PrimingSurvivesAFailedFirstTick: an error tick is not a snapshot,
+// so the first SUCCESSFUL one still primes.
+func TestSampleOnce_PrimingSurvivesAFailedFirstTick(t *testing.T) {
+	s := NewUserSampler(nil)
+	var calls int
+	s.OnDeltas = func(map[string]UserDelta) { calls++ }
+	q := &fakeUserQuerier{
+		snaps: []map[string]v2stats.Counters{
+			nil,
+			{"alice": {Uplink: 100, Downlink: 100}},
+			{"alice": {Uplink: 101, Downlink: 100}},
+		},
+		errs: []error{errors.New("down"), nil, nil},
+	}
+	s.sampleOnce(q, time.Second, false)
+	s.sampleOnce(q, time.Second, true)
+	if calls != 0 {
+		t.Fatalf("first successful snapshot after a failure must only prime, calls=%d", calls)
+	}
+	s.sampleOnce(q, time.Second, false)
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
 	}
 }
