@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -534,20 +535,20 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		writeConfigError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// Re-read: Put keeps the stored Used* counters (they belong to the sampler),
-	// so the answer must come from the registry, not from the copy this handler
-	// mutated — a tick that landed mid-request would otherwise be reported away.
+	// Answer from the registry, not from the copy this handler mutated: Put keeps
+	// the stored Used* counters (they belong to the sampler alone), so the copy
+	// is only as fresh as the Get above. Today the two agree — the Get already
+	// carried the counters — so this is a cheap guarantee about where the numbers
+	// come from, not a fix for a bug a test could reproduce.
 	if stored, ok := h.panelUsers.Get(id); ok {
 		u = stored
 	}
 	view := newUserView(u, time.Now().Unix())
-	// Immediate enforcement + reload-on-change. sing-box takes the change here;
-	// naive is dest's, and a lifecycle decision that did not reach dest leaves
-	// the user still connecting over naive — said out loud rather than logged,
-	// because the panel would otherwise report a clean success.
-	if err := h.syncRejectRule(); err != nil {
-		view.Warning = fmt.Sprintf("the change did not reach dest, so naive still uses the previous user list: %v", err)
-	}
+	// Immediate enforcement + reload-on-change. Whatever kept it from being
+	// immediate — a pending draft, a read-only config, a dest that refused —
+	// travels in the answer: the panel would otherwise report a clean success
+	// over a user who is still connecting.
+	view.Warning = enforcementWarning(h.syncRejectRule())
 	writeSuccess(w, view)
 }
 
@@ -579,12 +580,25 @@ func (h *Handler) ResetUserTraffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := newUserView(u, now)
-	// Same as UpdateUser: a decision that did not reach dest leaves naive on the
-	// old list, so it is said out loud instead of only logged.
-	if err := h.syncRejectRule(); err != nil {
-		view.Warning = fmt.Sprintf("the change did not reach dest, so naive still uses the previous user list: %v", err)
-	}
+	// Same as UpdateUser: whatever stopped the re-admission short of the running
+	// process is said out loud instead of only logged.
+	view.Warning = enforcementWarning(h.syncRejectRule())
 	writeSuccess(w, view)
+}
+
+// enforcementWarning turns syncRejectRule's two answers into the one sentence a
+// user response carries, or "" when the change is live everywhere. Both halves
+// travel when both went wrong — they are different repairs (apply the draft /
+// fix dest), and picking one would hide the other.
+func enforcementWarning(deferred string, err error) string {
+	var parts []string
+	if deferred != "" {
+		parts = append(parts, "the change is saved but not in force yet: "+deferred)
+	}
+	if err != nil {
+		parts = append(parts, fmt.Sprintf("the change did not reach dest, so naive still uses the previous user list: %v", err))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // findActiveInbound returns the inbound with tag from an active config map.

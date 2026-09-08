@@ -1,42 +1,63 @@
 package api
 
 import (
+	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"routebox/backend/internal/users"
 )
 
 // syncRejectRule recomputes the reject set from the registry and writes it to the
-// active config, reloading the process when the managed rule changed. No-op /
-// deferred when there is no users manager, when nothing changed, or when a draft
-// is pending (SyncRejectRuleActive defers internally). The same recomputation
-// then reaches dest, which enforces the lifecycle for naive on its own. Reload
-// failure falls back to Restart (matching ApplyConfig). Best-effort: failures
-// are logged, never fatal. Status is read via getProcessStatus()
-// (test-overridable) so a nil h.process never panics.
+// active config, reloading the process when the managed rule changed. The same
+// recomputation then reaches dest, which enforces the lifecycle for naive on its
+// own. Reload failure falls back to Restart (matching ApplyConfig). Status is
+// read via getProcessStatus() (test-overridable) so a nil h.process never panics.
 //
-// The one failure it returns instead of only logging is dest's: a lifecycle
-// decision that did not reach dest leaves the user connecting over naive after
-// the panel said they were disabled, and the PATCH handler is standing right
-// there with an answer to put it in.
+// It returns the two ways the decision can fail to take effect, because a
+// lifecycle change the panel reports as done while the user still connects is
+// the one outcome nobody can debug from the UI:
 //
-// Used by the PATCH handler, the startup one-shot, and the expiry ticker. NOT
-// used inside ApplyConfig (which issues its own reload — see config_handlers.go).
-func (h *Handler) syncRejectRule() error {
+//   - deferred — the rule was NOT written or NOT reloaded, and the caller's
+//     answer should say so: a pending config draft (SyncRejectRuleActive defers
+//     to the coming Apply), a read-only config, a write that failed, or a reload
+//     AND restart that both failed. Empty when the rule is live. Nothing is
+//     reported when the wanted rule is already the one in the active config —
+//     a deferral that changes nothing is not a deferral.
+//   - err — dest's: a decision that did not reach dest leaves the user
+//     connecting over naive after the panel said they were disabled, and the
+//     PATCH handler is standing right there with an answer to put it in.
+//
+// Used by the PATCH/reset handlers, the startup one-shot, and the expiry ticker.
+// NOT used inside ApplyConfig (which issues its own reload — see
+// config_handlers.go).
+func (h *Handler) syncRejectRule() (deferred string, err error) {
 	if h.panelUsers == nil {
-		return nil
+		return "", nil
 	}
 	names := users.EffectiveRejectNames(h.panelUsers.List(), time.Now().Unix())
-	changed, err := h.config.SyncRejectRuleActive(names)
-	if err != nil {
-		log.Printf("users: reject-rule sync failed: %v", err)
-		return nil
+	// What the active config would have to become. Compared BEFORE the write so
+	// a deferral is only reported when it actually withholds something.
+	pending := !sameNames(names, activeRejectNames(h.config.GetActive()))
+	changed, syncErr := h.config.SyncRejectRuleActive(names)
+	if syncErr != nil {
+		log.Printf("users: reject-rule sync failed: %v", syncErr)
+		return fmt.Sprintf("the reject rule could not be written: %v", syncErr), nil
+	}
+	if !changed && pending {
+		switch {
+		case h.config.IsReadOnly():
+			deferred = "the sing-box config is read-only, so the rule was not written"
+		case h.config.HasDraft():
+			deferred = "a config draft is pending — apply it to enforce this"
+		}
 	}
 	if changed && h.getProcessStatus().Running {
 		if err := h.process.Reload(); err != nil {
 			if err := h.process.Restart(h.config.GetPath()); err != nil {
 				log.Printf("users: reload after reject-rule sync failed: %v", err)
+				deferred = fmt.Sprintf("the rule is written but amnezia-box did not take it: %v", err)
 			}
 		}
 	}
@@ -45,9 +66,55 @@ func (h *Handler) syncRejectRule() error {
 	// nothing.
 	if err := h.syncDest(); err != nil {
 		log.Printf("dest: naive user sync failed: %v", err)
-		return err
+		return deferred, err
+	}
+	return deferred, nil
+}
+
+// activeRejectNames returns the auth_user names of RouteBox's managed reject rule
+// in an active config, or nil when it holds none. Mirrors config.managedRejectRule
+// (unexported there): action=="reject", a non-empty auth_user, and exactly those
+// two keys — anything else is an operator's own rule. Sorted like
+// users.EffectiveRejectNames so the two are directly comparable. PURE.
+func activeRejectNames(active map[string]interface{}) []string {
+	route, _ := active["route"].(map[string]interface{})
+	rules, _ := route["rules"].([]interface{})
+	for _, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok || len(rm) != 2 {
+			continue
+		}
+		if action, _ := rm["action"].(string); action != "reject" {
+			continue
+		}
+		au, ok := rm["auth_user"].([]interface{})
+		if !ok || len(au) == 0 {
+			continue
+		}
+		out := make([]string, 0, len(au))
+		for _, n := range au {
+			if s, ok := n.(string); ok {
+				out = append(out, s)
+			}
+		}
+		sort.Strings(out)
+		return out
 	}
 	return nil
+}
+
+// sameNames reports whether two name sets are equal element-wise (both sorted by
+// their producers). PURE.
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // SyncRejectRuleAndReload is the exported entry point for main.go: the expiry
@@ -57,7 +124,10 @@ func (h *Handler) syncRejectRule() error {
 // Nobody is waiting on these two, so the dest failure that the PATCH handler
 // answers with is only logged here — the next apply or PATCH surfaces it.
 func (h *Handler) SyncRejectRuleAndReload() {
-	if err := h.syncRejectRule(); err != nil {
+	// The deferral is dropped here on purpose: a pending draft or a read-only
+	// config would otherwise log the same line every 30 seconds forever, and
+	// both states are already on the panel. The handlers answer with it.
+	if _, err := h.syncRejectRule(); err != nil {
 		log.Printf("users: lifecycle sync to dest failed: %v", err)
 	}
 }

@@ -1325,6 +1325,10 @@ func TestUpdateUser_QuotaBelowUsedSuspendsThenRaisingReadmits(t *testing.T) {
 	if view.SuspendReason != "quota" {
 		t.Fatalf("suspend_reason = %q, want \"quota\"", view.SuspendReason)
 	}
+	// Enforced here and now: nothing to warn about.
+	if view.Warning != "" {
+		t.Fatalf("an applied change must carry no warning, got %q", view.Warning)
+	}
 	if au := rejectRuleNames(cfg.GetActive()); len(au) != 1 || au[0] != "alice" {
 		t.Fatalf("lowering below used must suspend immediately, reject auth_user=%#v", au)
 	}
@@ -1375,8 +1379,10 @@ func TestUpdateUser_QuotaOmittedUnchanged(t *testing.T) {
 }
 
 // TestUpdateUser_QuotaSaveKeepsCounters guards the Put-preserves-Used* contract
-// from the API side: a sampler tick landing before the save must not be erased by
-// the handler's Get→mutate→Put.
+// from the API side: saving a limit must neither zero the stored counters nor
+// answer with zeros. It does NOT exercise the re-read after Put — the copy this
+// handler holds already carries the counters, and there is no seam to land a
+// sampler tick in between; the re-read is justified by reading it, not by a test.
 func TestUpdateUser_QuotaSaveKeepsCounters(t *testing.T) {
 	h, _, um := newUsersTestHandler(t)
 	h.statusSource = func() process.Status { return process.Status{Running: false} }
@@ -1510,5 +1516,137 @@ func TestListUsers_IncludesQuotaFields(t *testing.T) {
 		if !strings.Contains(w.Body.String(), key) {
 			t.Fatalf("list JSON missing %s: %s", key, w.Body.String())
 		}
+	}
+}
+
+// TestUpdateUser_QuotaDeferredByDraftWarns pins the honesty of "immediately": a
+// pending draft makes SyncRejectRuleActive defer, so sing-box keeps running the
+// old rule while the panel would otherwise report a clean success. The answer
+// must say so in `warning`, and the active config must be left alone.
+func TestUpdateUser_QuotaDeferredByDraftWarns(t *testing.T) {
+	h, cfg, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	id := um.List()[0].ID
+	spendUsage(t, um, "alice", 600)
+	if err := cfg.EnsureDraft(); err != nil { // an edit is pending
+		t.Fatal(err)
+	}
+
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"quota_bytes":500}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	view := userViewOf(t, w.Body.Bytes())
+	if view.SuspendReason != "quota" {
+		t.Fatalf("suspend_reason = %q, want \"quota\"", view.SuspendReason)
+	}
+	if view.Warning == "" {
+		t.Fatal("a change that is stored but not enforced must not answer clean")
+	}
+	if !strings.Contains(view.Warning, "draft") {
+		t.Errorf("the warning must name the reason (a pending draft): %q", view.Warning)
+	}
+	if au := rejectRuleNames(cfg.GetActive()); au != nil {
+		t.Fatalf("a pending draft must defer the rule, got %#v", au)
+	}
+}
+
+// TestResetUserTraffic_DeferredByReadOnlyConfigWarns is the same honesty on the
+// reset route, for the other deferral: the sing-box config cannot be written, so
+// the re-admission is stored but not enforced.
+func TestResetUserTraffic_DeferredByReadOnlyConfigWarns(t *testing.T) {
+	h, cfg, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	u := um.List()[0]
+	id := u.ID
+	u.QuotaBytes = 500
+	if err := um.Put(&u); err != nil {
+		t.Fatal(err)
+	}
+	spendUsage(t, um, "alice", 600)
+	h.syncRejectRule() // alice is rejected in the active config
+	if au := rejectRuleNames(cfg.GetActive()); len(au) != 1 {
+		t.Fatalf("precondition: alice must be quota-suspended, got %#v", au)
+	}
+	cfg.SetReadOnly(true) // the users store stays writable; the config does not
+
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPost, "/api/users/"+id+"/traffic/reset", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	view := userViewOf(t, w.Body.Bytes())
+	if view.SuspendReason != "" {
+		t.Fatalf("suspend_reason = %q, want \"\" after the reset", view.SuspendReason)
+	}
+	if view.Warning == "" {
+		t.Fatal("a re-admission that did not reach the config must not answer clean")
+	}
+	if !strings.Contains(view.Warning, "read-only") {
+		t.Errorf("the warning must name the reason (read-only config): %q", view.Warning)
+	}
+	// And the stale rule is still there — which is exactly what the warning is for.
+	if au := rejectRuleNames(cfg.GetActive()); len(au) != 1 {
+		t.Fatalf("read-only config must keep the old rule, got %#v", au)
+	}
+}
+
+// TestResetUserTraffic_ExpiredStaysSuspended: the counter reset is not a renewal.
+// A user whose date has passed goes back to "expired" the moment the quota stops
+// being the reason (spec Q18 priority) and stays rejected.
+func TestResetUserTraffic_ExpiredStaysSuspended(t *testing.T) {
+	h, cfg, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	u := um.List()[0]
+	id := u.ID
+	u.QuotaBytes = 500
+	u.ExpiresAt = 1000 // long past
+	if err := um.Put(&u); err != nil {
+		t.Fatal(err)
+	}
+	spendUsage(t, um, "alice", 600)
+
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPost, "/api/users/"+id+"/traffic/reset", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if view := userViewOf(t, w.Body.Bytes()); view.SuspendReason != "expired" {
+		t.Fatalf("suspend_reason = %q, want \"expired\"", view.SuspendReason)
+	}
+	if au := rejectRuleNames(cfg.GetActive()); len(au) != 1 || au[0] != "alice" {
+		t.Fatalf("an expired user must stay rejected after a counter reset, got %#v", au)
+	}
+}
+
+// TestUpdateUser_ManualBeatsQuotaInReason pins the priority in the answer: an
+// operator who switched the user off sees "manual", not the quota underneath it.
+func TestUpdateUser_ManualBeatsQuotaInReason(t *testing.T) {
+	h, _, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	id := um.List()[0].ID
+	spendUsage(t, um, "alice", 600)
+
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPatch, "/api/users/"+id,
+		strings.NewReader(`{"enabled":false,"quota_bytes":500}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	view := userViewOf(t, w.Body.Bytes())
+	if view.SuspendReason != "manual" {
+		t.Fatalf("suspend_reason = %q, want \"manual\"", view.SuspendReason)
+	}
+	if view.QuotaBytes != 500 {
+		t.Fatalf("the quota must still be stored, got %d", view.QuotaBytes)
 	}
 }
