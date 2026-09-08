@@ -296,12 +296,33 @@ export interface PanelUser {
 	token?: string;
 	token_disabled?: boolean;
 	bindings: PanelBinding[];
+	// Traffic history totals out of SQLite, for the picked range. A DIFFERENT
+	// number from used_rx/used_tx below, with a different lifetime — the quota
+	// counters reset on demand, this history does not — and the PATCH/reset
+	// answers carry them as 0, so a row must never take them from a response.
 	upload?: number;
 	download?: number;
+	/** One-shot limit on used_rx + used_tx, in bytes; 0 = no limit (#95). */
+	quota_bytes: number;
+	/** Cumulative bytes since used_reset_at, topped up on the 30 s tick. */
+	used_rx: number;
+	used_tx: number;
+	/** Unix seconds the counters were last zeroed; 0 = never. */
+	used_reset_at: number;
+	/**
+	 * The ONE reason the user is out of service, by priority manual -> quota ->
+	 * expired (spec Q18). Derived by the backend per request, never stored, so
+	 * the row cannot disagree with the reject rule the same numbers produce.
+	 * Empty while the user is in service.
+	 */
+	suspend_reason: SuspendReason;
 	/** Set when a lifecycle change was made but did not reach dest, which serves
 	 * naive on its own — the user is disabled for sing-box and not for naive. */
 	warning?: string;
 }
+
+/** Why a panel user is out of service; '' = in service. */
+export type SuspendReason = '' | 'manual' | 'quota' | 'expired';
 
 export interface UserTrafficPoint {
 	ts: number;

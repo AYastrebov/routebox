@@ -87,3 +87,28 @@ export function suspendLabelKey(p: { suspend_reason: string }): string {
 			return 'awg.suspended';
 	}
 }
+
+/**
+ * Bytes -> the number a GB input is PREFILLED with, or null for "no limit".
+ *
+ * Unlike bytesToGb this never changes the limit: it returns the SHORTEST GB
+ * value that converts back to the same byte count, so an untouched Save writes
+ * back exactly what was stored. The plain division cannot be shown as it is —
+ * 0.1 GB is stored as 107374182 bytes (the half byte is rounded away) and
+ * divides back to 0.099999999627471, which is what the field would then show.
+ * Widening the precision one digit at a time and stopping at the first value
+ * that round-trips gives 0.1 here and 1.3 for 1395864371, without ever handing
+ * back a number that means a different quota.
+ */
+export function gbFieldValue(bytes: number): number | null {
+	if (!Number.isFinite(bytes) || bytes <= 0) return null;
+	const exact = bytes / GB;
+	const target = Math.round(bytes);
+	for (let digits = 1; digits <= 15; digits++) {
+		const candidate = Number(exact.toPrecision(digits));
+		if (gbToBytes(candidate) === target) return candidate;
+	}
+	// Unreachable for anything the API can store (a double survives 15 digits);
+	// the exact quotient is still the safe answer, only an ugly one.
+	return exact;
+}

@@ -290,11 +290,22 @@ export const api = {
 		request<{ message: string }>(`/users/${encodeURIComponent(id)}/token`, {
 			method: 'DELETE'
 		}),
-	updateUser: (id: string, body: { enabled?: boolean; expires_at?: number }) =>
+	// The user's lifecycle fields. They are independent and the page saves them
+	// from separate controls, so an OMITTED field keeps its stored value — never
+	// send `{expires_at: 0}` from the quota control, that would clear a date the
+	// control never showed. quota_bytes 0 = no limit (a negative is refused by
+	// the API rather than read as "unlimited").
+	updateUser: (id: string, body: { enabled?: boolean; expires_at?: number; quota_bytes?: number }) =>
 		request<PanelUser>(`/users/${encodeURIComponent(id)}`, {
 			method: 'PATCH',
 			body: JSON.stringify(body)
 		}),
+	// Zero the user's cumulative quota counters and stamp used_reset_at. Keeps
+	// the limit — this is "start the allowance over", not "remove it". The answer
+	// carries upload/download as 0 (they are the SQLite history, not this
+	// counter), so merge only the quota fields from it.
+	resetUserTraffic: (id: string) =>
+		request<PanelUser>(`/users/${encodeURIComponent(id)}/traffic/reset`, { method: 'POST' }),
 
 	// AmneziaWG server inbound (panel/vps mode)
 	awgStatus: () => request<AwgStatus>('/awg/status'),

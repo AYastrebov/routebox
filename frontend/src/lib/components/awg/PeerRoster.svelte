@@ -7,7 +7,7 @@
 	import type { AwgPeer } from '$lib/types';
 	import { formatBytes } from '$lib/stores/settings';
 	import { expiryStatus, unixToDateInput, dateInputToUnix, presetExpiry } from './peerExpiry';
-	import { GB, gbToBytes, quotaUsage, suspendLabelKey } from './peerQuota';
+	import { gbToBytes, gbFieldValue, quotaUsage, suspendLabelKey } from './peerQuota';
 	import { copyText } from '$lib/utils/clipboard';
 
 	interface Props {
@@ -79,9 +79,10 @@
 	}
 	function openQuota(p: AwgPeer) {
 		quotaFor = p.public_key;
-		// Raw, NOT bytesToGb: rounding here would make an untouched Save rewrite
+		// Exact, NOT bytesToGb: rounding here would make an untouched Save rewrite
 		// the stored limit (1.25 GB -> 1.3, and anything under 0.05 GB -> 0 = none).
-		quotaGb = p.quota_bytes > 0 ? p.quota_bytes / GB : null;
+		// gbFieldValue only trims the float noise of the division (1.29999999...).
+		quotaGb = gbFieldValue(p.quota_bytes);
 		renewing = null;
 		resetArmed = null;
 	}

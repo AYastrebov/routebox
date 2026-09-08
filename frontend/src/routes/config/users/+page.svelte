@@ -6,6 +6,12 @@
 	import Modal from '$lib/components/shared/Modal.svelte';
 	import ShareModal from '$lib/components/config/users/ShareModal.svelte';
 	import Sparkline from '$lib/components/shared/Sparkline.svelte';
+	import { gbToBytes, gbFieldValue } from '$lib/components/awg/peerQuota';
+	import {
+		userQuotaUsage,
+		userSuspendLabelKey,
+		mergeQuotaFields
+	} from '$lib/components/config/users/userQuota';
 	import type { PanelUser, Inbound, UserTrafficResponse } from '$lib/types';
 
 	let users = $state<PanelUser[]>([]);
@@ -28,6 +34,22 @@
 	let publicPort = $state<number | undefined>(undefined);
 
 	const serverTypes = ['vless', 'naive', 'hysteria2', 'mieru'];
+
+	// Traffic quota per user (#95), all keyed by user id because the controls sit
+	// inline in every row (there is no per-user edit form on this page).
+	// quotaGb holds what the number input shows in GB (null = empty = no limit);
+	// quotaEls holds the elements, because the BINDING cannot tell the two ways
+	// of being empty apart: text the browser could not parse ("1,5" on an English
+	// page in Firefox) binds as null exactly like a cleared field — and a cleared
+	// field means "remove the limit". validity.badInput is the difference.
+	let quotaGb = $state<Record<string, number | null>>({});
+	let quotaEls = $state<Record<string, HTMLInputElement | null>>({});
+	let savingQuota = $state<string | null>(null);
+	// Zeroing the counters is destructive and lives in the row, so it confirms in
+	// the row: the first click arms it, the second does it (spec Q9). One id at a
+	// time, so arming another row disarms this one.
+	let resetArmed = $state<string | null>(null);
+	let resetting = $state(false);
 
 	// Per-user traffic history, lazily fetched on expand. Keyed by user id.
 	// 'loading' marks an in-flight fetch so the row can show a placeholder.
@@ -53,6 +75,7 @@
 		loading = true;
 		try {
 			users = await api.getUsers();
+			prefillQuotas();
 			const inbounds = await api.listInbounds();
 			serverInbounds = (inbounds as Inbound[])
 				.filter((i) => serverTypes.includes(i.type))
@@ -105,13 +128,15 @@
 		}
 	}
 
-	type UserStatus = 'active' | 'disabled' | 'expired';
-	function userStatus(u: PanelUser): UserStatus {
-		if (!u.enabled) return 'disabled';
-		if (u.expires_at && u.expires_at > 0 && u.expires_at <= Math.floor(Date.now() / 1000)) {
-			return 'expired';
+	// The number the field shows is the stored limit, exactly: an untouched Save
+	// then sends back the same byte count instead of a rounded one.
+	function prefillQuotas() {
+		const next: Record<string, number | null> = {};
+		for (const u of users) {
+			if (u.id) next[u.id] = gbFieldValue(u.quota_bytes ?? 0);
 		}
-		return 'active';
+		quotaGb = next;
+		resetArmed = null;
 	}
 
 	// The native date input is kept off-screen and driven by a styled button, the
@@ -163,6 +188,71 @@
 			await load();
 		} catch (e) {
 			notifications.error(`${e}`);
+		}
+	}
+
+	// Every way of NOT having a number is refused before the PATCH, because 0 on
+	// the wire means "remove the limit": unparseable text and a negative would
+	// both hand a user unlimited traffic under a success toast.
+	function quotaInputRejected(el: HTMLInputElement | null, gb: number | null): boolean {
+		if (el?.validity.badInput) {
+			notifications.error($t('awg.quotaInvalid'));
+			return true;
+		}
+		if (gb !== null && gb < 0) {
+			notifications.error($t('awg.quotaNegative'));
+			return true;
+		}
+		return false;
+	}
+
+	// PATCH and reset answer from the registry alone, where the SQLite history
+	// totals are zero — so only the quota fields come back into the row, and the
+	// traffic column the operator can see keeps the numbers the list fetched.
+	function applyQuotaAnswer(id: string, updated: PanelUser) {
+		users = users.map((x) => (x.id === id ? mergeQuotaFields(x, updated) : x));
+		quotaGb[id] = gbFieldValue(updated.quota_bytes ?? 0);
+	}
+
+	// Saves ONLY the quota: expiry is edited by its own control in the same row,
+	// and an omitted field keeps its stored value, so this cannot clear a date.
+	async function saveQuota(u: PanelUser) {
+		const gb = quotaGb[u.id] ?? null;
+		if (quotaInputRejected(quotaEls[u.id], gb)) return;
+		const bytes = gbToBytes(gb ?? 0);
+		// Compare in bytes: the field shows the stored limit divided by 1024^3, and
+		// an operator who only came to look must not have it rewritten by the trip.
+		if (bytes === (u.quota_bytes ?? 0)) {
+			notifications.info($t('awg.quotaUnchanged'));
+			return;
+		}
+		savingQuota = u.id;
+		try {
+			const updated = await api.updateUser(u.id, { quota_bytes: bytes });
+			notifications.success($t('awg.quotaSaved'));
+			applyQuotaAnswer(u.id, updated);
+			warnIfNotEverywhere(updated);
+		} catch (e) {
+			notifications.error(`${$t('awg.quotaFailed')}: ${e}`);
+		} finally {
+			savingQuota = null;
+		}
+	}
+
+	// Zeroes the counters and keeps the limit: "start the allowance over". A user
+	// suspended by the quota is back in service the moment this returns.
+	async function resetTraffic(u: PanelUser) {
+		resetting = true;
+		try {
+			const updated = await api.resetUserTraffic(u.id);
+			notifications.success($t('awg.trafficReset'));
+			applyQuotaAnswer(u.id, updated);
+			warnIfNotEverywhere(updated);
+			resetArmed = null;
+		} catch (e) {
+			notifications.error(`${$t('awg.trafficResetFailed')}: ${e}`);
+		} finally {
+			resetting = false;
 		}
 	}
 
@@ -239,19 +329,30 @@
 	{:else}
 		<div class="space-y-3">
 			{#each users as u, i (u.id || `${u.name} ${u.bindings[0]?.credential ?? ''} ${i}`)}
-				<section class="bg-[var(--ctp-mantle)] rounded-lg p-5 border border-[var(--ctp-surface0)]">
+				{@const usage = userQuotaUsage(u)}
+				<!-- Out of service is the SERVER's verdict, not one this row recomputes:
+				     a manual toggle, a spent quota and a passed date all hold a user
+				     back, and only the backend knows how many bytes the last tick
+				     folded in (#95). -->
+				<section class="bg-[var(--ctp-mantle)] rounded-lg p-5 border border-[var(--ctp-surface0)]"
+					class:dimmed={!u.pending && u.suspend_reason !== ''}>
 					<div class="flex items-start justify-between gap-4 flex-wrap">
 						<div class="min-w-0">
 							<div class="flex items-center gap-2">
 								<h2 class="text-lg font-medium text-[var(--ctp-text)]">{u.name || '(unnamed)'}</h2>
+								<!-- One reason, the one to undo first: manual -> quota -> expired
+								     (spec Q18). The quota badge says out loud that the check is
+								     periodic, so a user still connecting for a few seconds after
+								     spending the last byte is not read as a bug. -->
 								{#if u.pending}
 									<span class="status-badge info">{$t('users.pending')}</span>
-								{:else if userStatus(u) === 'active'}
+								{:else if u.suspend_reason === ''}
 									<span class="status-badge success">{$t('users.active')}</span>
-								{:else if userStatus(u) === 'expired'}
-									<span class="status-badge error">{$t('users.expired')}</span>
 								{:else}
-									<span class="status-badge info">{$t('users.disabledLabel')}</span>
+									<span class="status-badge {u.suspend_reason === 'manual' ? 'info' : 'error'}"
+										title={u.suspend_reason === 'quota' ? $t('awg.suspendCheckHint') : ''}>
+										{$t(userSuspendLabelKey(u))}
+									</span>
 								{/if}
 							</div>
 							<div class="mt-2 flex flex-wrap gap-1">
@@ -271,6 +372,20 @@
 										<Sparkline values={(expanded[u.id] as UserTrafficResponse).history.map((p) => p.upload + p.download)} />
 									{/if}
 								</div>
+								<!-- The quota's own counters (rx + tx since the last reset), a
+								     different number from the traffic history above it. -->
+								{#if usage.quota > 0}
+									<div class="quota-line">
+										<div class="quota-track">
+											<div class="quota-fill" class:over={usage.exhausted} style="width: {usage.pct}%"></div>
+										</div>
+										<span class="quota-text">
+											{$t('awg.quotaUsed', {
+												values: { used: formatBytes(usage.used), quota: formatBytes(usage.quota) }
+											})}
+										</span>
+									</div>
+								{/if}
 							{/if}
 						</div>
 						<div class="flex items-center gap-2 flex-wrap">
@@ -299,6 +414,25 @@
 									</button>
 									{#if expiry}
 										<button type="button" class="expiry-clear" onclick={() => setExpiry(u, '')}>{$t('users.never')}</button>
+									{/if}
+								</div>
+								<!-- The second limit, beside the first (spec Q17). This page has no
+								     per-user form, so the quota is edited where the date is. -->
+								<div class="quota-cell">
+									<label class="expiry-label" for="quota-{u.id}">{$t('awg.quotaGb')}</label>
+									<input id="quota-{u.id}" class="quota-input" type="number" min="0" step="any"
+										placeholder={$t('awg.quotaNoLimit')} title={$t('awg.quotaHint')}
+										bind:value={quotaGb[u.id]} bind:this={quotaEls[u.id]} />
+									<button type="button" class="expiry-clear" disabled={savingQuota === u.id}
+										onclick={() => saveQuota(u)}>{$t('awg.saveQuota')}</button>
+									<!-- Destructive, so it confirms where it stands: first click arms,
+									     second click zeroes the counters (spec Q9). -->
+									{#if resetArmed === u.id}
+										<button type="button" class="expiry-clear reset-confirm" disabled={resetting}
+											onclick={() => resetTraffic(u)}>{$t('awg.resetCounterConfirm')}</button>
+									{:else}
+										<button type="button" class="expiry-clear"
+											onclick={() => (resetArmed = u.id)}>{$t('awg.resetCounter')}</button>
 									{/if}
 								</div>
 							{/if}
@@ -454,5 +588,75 @@
 	.expiry-clear:hover {
 		border-color: var(--ctp-primary);
 		color: var(--ctp-primary);
+	}
+	.expiry-clear:disabled {
+		opacity: 0.5;
+		cursor: default;
+	}
+
+	/* A row the server holds out of service reads as inactive, whatever the
+	   reason: the badge names it, the dimming makes it findable in a long list. */
+	.dimmed {
+		opacity: 0.6;
+	}
+
+	/* Quota bar under the traffic numbers: thin, and only as wide as the text
+	   beside it, so it reads as part of the row and not as a page-wide meter. */
+	.quota-line {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-top: 0.4rem;
+		max-width: 22rem;
+	}
+	.quota-track {
+		flex: 1;
+		height: 4px;
+		border-radius: 9999px;
+		background: var(--ctp-surface1);
+		overflow: hidden;
+	}
+	.quota-fill {
+		height: 100%;
+		border-radius: 9999px;
+		background: var(--ctp-primary);
+		transition: width 0.2s ease;
+	}
+	.quota-fill.over {
+		background: var(--ctp-red);
+	}
+	.quota-text {
+		color: var(--ctp-overlay1);
+		font-size: 0.75rem;
+		white-space: nowrap;
+	}
+
+	.quota-cell {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.quota-input {
+		width: 6rem;
+		background: var(--ctp-mantle);
+		border: 1px solid var(--ctp-surface2);
+		border-radius: 0.5rem;
+		padding: 0.375rem 0.55rem;
+		color: var(--ctp-text);
+		font-size: 0.875rem;
+	}
+	.quota-input:focus {
+		outline: none;
+		border-color: var(--ctp-primary);
+	}
+	.reset-confirm {
+		border-color: var(--ctp-red);
+		color: var(--ctp-red);
+		background: color-mix(in srgb, var(--ctp-red) 12%, transparent);
+	}
+	.reset-confirm:hover {
+		border-color: var(--ctp-red);
+		color: var(--ctp-red);
+		background: color-mix(in srgb, var(--ctp-red) 22%, transparent);
 	}
 </style>

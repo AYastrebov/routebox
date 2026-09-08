@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { GB, gbToBytes, bytesToGb, quotaUsage, suspendLabelKey } from './peerQuota';
+import { GB, gbToBytes, bytesToGb, gbFieldValue, quotaUsage, suspendLabelKey } from './peerQuota';
 
 describe('gbToBytes', () => {
 	it('uses 1024^3, not 1000^3', () => expect(gbToBytes(1)).toBe(1_073_741_824));
@@ -68,4 +68,31 @@ describe('suspendLabelKey', () => {
 		expect(suspendLabelKey({ suspend_reason: 'expired' })).toBe('awg.suspendedExpired'));
 	it('falls back to the plain badge for an unknown reason', () =>
 		expect(suspendLabelKey({ suspend_reason: 'manual' })).toBe('awg.suspended'));
+});
+
+describe('gbFieldValue', () => {
+	// The reason it exists: the stored byte count is rounded, so the plain
+	// division has noise in it and the field would show that noise.
+	it('shows the round number the operator typed', () => {
+		expect(gbToBytes(0.1) / GB).not.toBe(0.1); // guards the premise, not the helper
+		expect(gbFieldValue(gbToBytes(0.1))).toBe(0.1);
+		expect(gbFieldValue(gbToBytes(1.3))).toBe(1.3);
+	});
+	it('round-trips whatever an operator can type', () => {
+		for (const gb of [0.1, 0.25, 1, 1.5, 2.7, 10, 512.25, 0.003]) {
+			expect(gbFieldValue(gbToBytes(gb))).toBe(gb);
+		}
+	});
+	// The property the prefill rests on: an untouched Save sends back the same
+	// byte count it was filled from, so it cannot rewrite the stored limit.
+	it('survives the trip back to bytes unchanged', () => {
+		for (const bytes of [1, 1024, 107_374_182, 1_395_864_371, 7 * GB + 13]) {
+			expect(gbToBytes(gbFieldValue(bytes) as number)).toBe(bytes);
+		}
+	});
+	it('shows an empty field for no limit', () => {
+		expect(gbFieldValue(0)).toBe(null);
+		expect(gbFieldValue(-1)).toBe(null);
+		expect(gbFieldValue(NaN)).toBe(null);
+	});
 });
