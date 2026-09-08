@@ -48,28 +48,21 @@
 	// always BBR outbound, whatever Download says). The profile below applies to
 	// whichever half ends up on BBR; '' leaves the fork's default (standard).
 
-	const fingerprints = ['chrome', 'firefox', 'safari', 'edge', 'ios', 'android', 'random', 'randomized'];
-
-	// Initialize obfs if needed
-	let obfsEnabled = $state(!!obfs?.type);
-	let obfsType = $state<string>(obfs?.type ?? '');
-	let obfsPassword = $state(obfs?.password ?? '');
-	// gecko only; 0 = leave hysteria's defaults (512 / 1200) on both ends.
-	let obfsMinPacketSize = $state(obfs?.min_packet_size ?? 0);
-	let obfsMaxPacketSize = $state(obfs?.max_packet_size ?? 0);
-
-	$effect(() => {
-		if (obfsEnabled && obfsType) {
-			const next: ObfsConfig = { type: obfsType as ObfsType, password: obfsPassword };
-			if (obfsType === 'gecko') {
-				if (obfsMinPacketSize > 0) next.min_packet_size = obfsMinPacketSize;
-				if (obfsMaxPacketSize > 0) next.max_packet_size = obfsMaxPacketSize;
-			}
-			obfs = next;
-		} else {
-			obfs = undefined;
-		}
-	});
+	// The obfs block edits the bound `obfs` directly. A local mirror initialised
+	// once at mount missed the import that lands while the form is open, and its
+	// effect then wrote `undefined` back over the imported obfs (#100).
+	function setObfsType(type: ObfsType) {
+		// Sizes are gecko-only; switching to salamander drops them.
+		obfs = { type, password: obfs?.password ?? '' };
+	}
+	// gecko only; empty = leave hysteria's defaults (512 / 1200) on both ends.
+	function setPacketSize(key: 'min_packet_size' | 'max_packet_size', raw: number) {
+		if (!obfs) return;
+		const next = { ...obfs };
+		if (raw > 0) next[key] = raw;
+		else delete next[key];
+		obfs = next;
+	}
 </script>
 
 <div class="space-y-4">
@@ -119,34 +112,18 @@
 	<div class="bg-[var(--ctp-surface0)] rounded-lg p-4 space-y-4">
 		<h3 class="text-sm font-medium text-[var(--ctp-subtext1)]">TLS</h3>
 
-		<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-			<div>
-				<label for="hy2-sni" class="block text-sm font-medium text-[var(--ctp-subtext1)] mb-1">
-					{$t('outbounds.sni')}
-				</label>
-				<input
-					id="hy2-sni"
-					type="text"
-					bind:value={tls.server_name}
-					placeholder="example.com"
-					class="w-full px-3 py-2 bg-[var(--ctp-mantle)] border border-[var(--ctp-surface2)] rounded-lg text-[var(--ctp-text)] placeholder-[var(--ctp-overlay0)] focus:outline-none focus:ring-2 focus:ring-[var(--ctp-primary)]"
-				/>
-			</div>
-			<div>
-				<label for="hy2-fp" class="block text-sm font-medium text-[var(--ctp-subtext1)] mb-1">
-					{$t('outbounds.fingerprint')}
-				</label>
-				<select
-					id="hy2-fp"
-					bind:value={tls.utls!.fingerprint}
-					class="w-full px-3 py-2 bg-[var(--ctp-mantle)] border border-[var(--ctp-surface2)] rounded-lg text-[var(--ctp-text)] focus:outline-none focus:ring-2 focus:ring-[var(--ctp-primary)]"
-				>
-					<option value="">{$t('common.none')}</option>
-					{#each fingerprints as fp}
-						<option value={fp}>{fp}</option>
-					{/each}
-				</select>
-			</div>
+		<!-- No fingerprint picker: QUIC has no uTLS in the binary (see OutboundForm). -->
+		<div>
+			<label for="hy2-sni" class="block text-sm font-medium text-[var(--ctp-subtext1)] mb-1">
+				{$t('outbounds.sni')}
+			</label>
+			<input
+				id="hy2-sni"
+				type="text"
+				bind:value={tls.server_name}
+				placeholder="example.com"
+				class="w-full px-3 py-2 bg-[var(--ctp-mantle)] border border-[var(--ctp-surface2)] rounded-lg text-[var(--ctp-text)] placeholder-[var(--ctp-overlay0)] focus:outline-none focus:ring-2 focus:ring-[var(--ctp-primary)]"
+			/>
 		</div>
 
 		<label class="flex items-center gap-2 text-sm text-[var(--ctp-subtext1)]">
@@ -246,28 +223,24 @@
 		<label class="flex items-center gap-2 text-sm font-medium text-[var(--ctp-subtext1)]">
 			<input
 				type="checkbox"
-				checked={obfsEnabled}
-				onchange={(e) => {
-					obfsEnabled = e.currentTarget.checked;
-					// Enabling with no type stored would emit obfs without a type.
-					if (obfsEnabled && !obfsType) obfsType = 'salamander';
-				}}
+				checked={!!obfs}
+				onchange={(e) => (obfs = e.currentTarget.checked ? { type: 'salamander', password: '' } : undefined)}
 				class="w-4 h-4 rounded border-[var(--ctp-surface2)] text-[var(--ctp-primary)] focus:ring-[var(--ctp-primary)]"
 			/>
 			{$t('outbounds.obfuscationType')}
 		</label>
 
-		{#if obfsEnabled}
+		{#if obfs}
 			<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 				<div>
 					<span class="block text-sm font-medium text-[var(--ctp-subtext1)] mb-1">
 						{$t('common.type')}
 					</span>
 					<div class="flex gap-2" role="group" aria-label={$t('common.type')}>
-						<button type="button" class="toggle-btn {obfsType === 'salamander' ? 'selected' : ''}"
-							onclick={() => (obfsType = 'salamander')}>Salamander</button>
-						<button type="button" class="toggle-btn {obfsType === 'gecko' ? 'selected' : ''}"
-							onclick={() => (obfsType = 'gecko')}>Gecko</button>
+						<button type="button" class="toggle-btn {obfs.type === 'salamander' ? 'selected' : ''}"
+							onclick={() => setObfsType('salamander')}>Salamander</button>
+						<button type="button" class="toggle-btn {obfs.type === 'gecko' ? 'selected' : ''}"
+							onclick={() => setObfsType('gecko')}>Gecko</button>
 					</div>
 				</div>
 				<div>
@@ -277,14 +250,14 @@
 					<input
 						id="hy2-obfs-pw"
 						type="password"
-						bind:value={obfsPassword}
+						bind:value={obfs.password}
 						placeholder="password"
 						class="w-full px-3 py-2 bg-[var(--ctp-mantle)] border border-[var(--ctp-surface2)] rounded-lg text-[var(--ctp-text)] placeholder-[var(--ctp-overlay0)] focus:outline-none focus:ring-2 focus:ring-[var(--ctp-primary)]"
 					/>
 				</div>
 			</div>
 
-			{#if obfsType === 'gecko'}
+			{#if obfs.type === 'gecko'}
 				<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 					<div>
 						<label for="hy2-obfs-min" class="block text-sm font-medium text-[var(--ctp-subtext1)] mb-1">
@@ -294,7 +267,8 @@
 							id="hy2-obfs-min"
 							type="number"
 							min="0"
-							bind:value={obfsMinPacketSize}
+							value={obfs.min_packet_size ?? ''}
+							oninput={(e) => setPacketSize('min_packet_size', e.currentTarget.valueAsNumber)}
 							class="w-full px-3 py-2 bg-[var(--ctp-mantle)] border border-[var(--ctp-surface2)] rounded-lg text-[var(--ctp-text)] focus:outline-none focus:ring-2 focus:ring-[var(--ctp-primary)]"
 						/>
 					</div>
@@ -306,7 +280,8 @@
 							id="hy2-obfs-max"
 							type="number"
 							min="0"
-							bind:value={obfsMaxPacketSize}
+							value={obfs.max_packet_size ?? ''}
+							oninput={(e) => setPacketSize('max_packet_size', e.currentTarget.valueAsNumber)}
 							class="w-full px-3 py-2 bg-[var(--ctp-mantle)] border border-[var(--ctp-surface2)] rounded-lg text-[var(--ctp-text)] focus:outline-none focus:ring-2 focus:ring-[var(--ctp-primary)]"
 						/>
 					</div>

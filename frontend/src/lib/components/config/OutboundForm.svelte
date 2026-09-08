@@ -122,11 +122,13 @@
 
 	// Hysteria2 state
 	let hy2Password = $state(outbound?.password ?? '');
+	// No utls here: hysteria2 rides QUIC, and the binary refuses a uTLS config
+	// on a QUIC dial ("unsupported usage for uTLS") — a fingerprint would break
+	// the outbound, not disguise it (#100).
 	let hy2Tls = $state<TLSConfig>({
 		enabled: true,
 		server_name: outbound?.tls?.server_name ?? '',
-		insecure: outbound?.tls?.insecure ?? false,
-		utls: { fingerprint: outbound?.tls?.utls?.fingerprint ?? '' }
+		insecure: outbound?.tls?.insecure ?? false
 	});
 	let hy2Obfs = $state<ObfsConfig | undefined>(outbound?.obfs);
 	let hy2ServerPorts = $state(outbound?.server_ports?.map(s => s.replace(':', '-')).join(', ') ?? '');
@@ -282,14 +284,16 @@
 		hy2Tls = {
 			enabled: true,
 			server_name: config.sni || config.server,
-			insecure: config.insecure || false,
-			utls: { fingerprint: '' }
+			insecure: config.insecure || false
 		};
+		hy2ServerPorts = config.serverPorts?.map((s) => s.replace(':', '-')).join(', ') ?? '';
 		if (config.obfs) {
 			hy2Obfs = { type: config.obfs as ObfsType, password: config.obfsPassword || '' };
 			// gecko sizes only work when both ends agree, so keep whatever the link carried (#48).
 			if (config.obfsMinPacketSize) hy2Obfs.min_packet_size = config.obfsMinPacketSize;
 			if (config.obfsMaxPacketSize) hy2Obfs.max_packet_size = config.obfsMaxPacketSize;
+		} else {
+			hy2Obfs = undefined;
 		}
 	}
 

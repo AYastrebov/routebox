@@ -58,6 +58,8 @@ export interface ParsedHysteria2 {
 	// gecko only: packet size bounds both ends must agree on (#48).
 	obfsMinPacketSize?: number;
 	obfsMaxPacketSize?: number;
+	// Port hopping ranges in sing-box form ("lo:hi"), from the link (#100).
+	serverPorts?: string[];
 }
 
 export interface ParsedShadowsocks {
@@ -306,7 +308,18 @@ export function parseHysteria2(uri: string): ParseResult {
 		const [hostPort, queryString] = serverPart.split('?');
 
 		// Parse host:port (supports [IPv6]:port)
-		const hp = splitHostPort(hostPort);
+		let hp = splitHostPort(hostPort);
+		let serverPorts: string[] | undefined;
+		if (!hp) {
+			// hysteria's own URI puts the hop ranges where the port goes:
+			// "srv:20000-50000,60000". The first port doubles as server_port (#100).
+			const i = hostPort.lastIndexOf(':');
+			const ranges = i > 0 ? hy2PortRanges(hostPort.slice(i + 1)) : null;
+			if (ranges) {
+				serverPorts = ranges;
+				hp = { host: hostPort.slice(0, i).replace(/^\[(.*)\]$/, '$1'), port: Number(ranges[0].split(':')[0]) };
+			}
+		}
 		if (!hp) {
 			return { success: false, error: 'Invalid Hysteria2 URI: invalid host:port' };
 		}
@@ -325,6 +338,10 @@ export function parseHysteria2(uri: string): ParseResult {
 		};
 
 		// Optional params
+		// Clash-style links carry the hop ranges in mport= instead (#100).
+		const mport = params.get('mport');
+		if (mport) serverPorts = hy2PortRanges(mport) ?? serverPorts;
+		if (serverPorts) config.serverPorts = serverPorts;
 		if (params.get('sni')) config.sni = params.get('sni')!;
 		if (params.get('insecure') === '1') config.insecure = true;
 		if (params.get('obfs')) config.obfs = params.get('obfs')!;
@@ -340,6 +357,24 @@ export function parseHysteria2(uri: string): ParseResult {
 	} catch (err) {
 		return { success: false, error: `Failed to parse Hysteria2 URI: ${err}` };
 	}
+}
+
+/**
+ * Hysteria2 port-hopping list "20000-50000,60000" → sing-box ranges
+ * ['20000:50000', '60000:60000']. sing-box takes "lo:hi" only and rejects bare
+ * numbers, so singles become degenerate ranges. Null when it is not a port list.
+ */
+export function hy2PortRanges(spec: string): string[] | null {
+	const out: string[] = [];
+	for (const part of spec.split(',')) {
+		const m = /^(\d+)(?:-(\d+))?$/.exec(part.trim());
+		if (!m) return null;
+		const lo = Number(m[1]);
+		const hi = m[2] === undefined ? lo : Number(m[2]);
+		if (lo < 1 || hi > 65535 || lo > hi) return null;
+		out.push(`${lo}:${hi}`);
+	}
+	return out.length ? out : null;
 }
 
 /**
@@ -938,6 +973,7 @@ export function toSingboxConfig(parsed: ParsedConfig): { endpoint?: Endpoint; ou
 				server_port: parsed.port,
 				password: parsed.password,
 			};
+			if (parsed.serverPorts) outbound.server_ports = parsed.serverPorts;
 
 			// TLS
 			outbound.tls = {

@@ -26,8 +26,7 @@ import {
 	parseConfig,
 	toSingboxConfig,
 	parseMieruLink,
-	normalizeMieruPort
-} from './parsers';
+	normalizeMieruPort, hy2PortRanges } from './parsers';
 import type { ParsedHysteria2 } from './parsers';
 
 describe('parseLines', () => {
@@ -662,6 +661,36 @@ describe('keepalive', () => {
 		for (const bad of ['abc', '30-22', '22-', '-5', '70000', '1-2-3']) {
 			expect(isValidKeepalive(bad)).toBe(false);
 		}
+	});
+});
+
+describe('hysteria2 port hopping (#100)', () => {
+	it('reads Clash-style mport= into sing-box "lo:hi" ranges', () => {
+		const r = parseHysteria2('hysteria2://pw@srv:443?mport=20000-50000,60000&sni=srv#h');
+		expect(r.success).toBe(true);
+		expect(r.config).toMatchObject({ port: 443, serverPorts: ['20000:50000', '60000:60000'] });
+	});
+
+	it("reads hysteria's own form with the ranges in place of the port", () => {
+		const r = parseHysteria2('hysteria2://pw@srv:20000-50000#h');
+		expect(r.success).toBe(true);
+		expect(r.config).toMatchObject({ server: 'srv', port: 20000, serverPorts: ['20000:50000'] });
+		const v6 = parseHysteria2('hy2://pw@[2001:db8::1]:20000-50000#h').config as ParsedHysteria2;
+		expect(v6.server).toBe('2001:db8::1');
+	});
+
+	it('leaves serverPorts unset without hopping and rejects garbage', () => {
+		expect((parseHysteria2('hy2://pw@srv:443#h').config as ParsedHysteria2).serverPorts).toBeUndefined();
+		expect(hy2PortRanges('abc')).toBeNull();
+		expect(hy2PortRanges('50000-20000')).toBeNull();
+		expect(hy2PortRanges('1-70000')).toBeNull();
+	});
+
+	it('carries the ranges into the outbound', () => {
+		const { outbound } = toSingboxConfig({
+			type: 'hy2', name: 'h', server: 'srv', port: 443, password: 'pw', serverPorts: ['20000:50000']
+		});
+		expect(outbound).toMatchObject({ server_port: 443, server_ports: ['20000:50000'] });
 	});
 });
 

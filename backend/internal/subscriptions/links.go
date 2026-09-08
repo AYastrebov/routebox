@@ -242,6 +242,18 @@ func parseHysteria2(uri string) (map[string]interface{}, string, error) {
 	}
 	hostPort, queryString, _ := strings.Cut(mainPart[atIdx+1:], "?")
 	host, port, ok := splitHostPort(hostPort)
+	var serverPorts []string
+	if !ok {
+		// hysteria's own URI puts the hop ranges where the port goes:
+		// "srv:20000-50000,60000". The first port doubles as server_port (#100).
+		if i := strings.LastIndexByte(hostPort, ':'); i > 0 {
+			if serverPorts = hy2PortRanges(hostPort[i+1:]); serverPorts != nil {
+				host = strings.TrimSuffix(strings.TrimPrefix(hostPort[:i], "["), "]")
+				port, _ = strconv.Atoi(serverPorts[0][:strings.IndexByte(serverPorts[0], ':')])
+				ok = true
+			}
+		}
+	}
 	if !ok {
 		return nil, "", fmt.Errorf("hysteria2: invalid host:port")
 	}
@@ -249,6 +261,13 @@ func parseHysteria2(uri string) (map[string]interface{}, string, error) {
 	ob := map[string]interface{}{
 		"type": "hysteria2", "server": host, "server_port": port, "password": password,
 		"tls": map[string]interface{}{"enabled": true, "server_name": orElse(params.Get("sni"), host), "insecure": params.Get("insecure") == "1"},
+	}
+	// Clash-style links carry the hop ranges in mport= instead (#100).
+	if r := hy2PortRanges(params.Get("mport")); r != nil {
+		serverPorts = r
+	}
+	if serverPorts != nil {
+		ob["server_ports"] = serverPorts
 	}
 	if obfs := params.Get("obfs"); obfs != "" {
 		o := map[string]interface{}{"type": obfs, "password": params.Get("obfs-password")}
@@ -265,6 +284,30 @@ func parseHysteria2(uri string) (map[string]interface{}, string, error) {
 		ob["obfs"] = o
 	}
 	return ob, name, nil
+}
+
+// hy2PortRanges turns a hysteria2 port-hopping list "20000-50000,60000" into
+// sing-box ranges ["20000:50000", "60000:60000"]. sing-box takes "lo:hi" only
+// and rejects bare numbers, so singles become degenerate ranges. Nil when the
+// text is not a port list.
+func hy2PortRanges(spec string) []string {
+	if spec == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(spec, ",") {
+		lo, hi, _ := strings.Cut(strings.TrimSpace(part), "-")
+		if hi == "" {
+			hi = lo
+		}
+		l, err1 := strconv.Atoi(lo)
+		h, err2 := strconv.Atoi(hi)
+		if err1 != nil || err2 != nil || l < 1 || h > 65535 || l > h {
+			return nil
+		}
+		out = append(out, fmt.Sprintf("%d:%d", l, h))
+	}
+	return out
 }
 
 func parseShadowsocks(uri string) (map[string]interface{}, string, error) {

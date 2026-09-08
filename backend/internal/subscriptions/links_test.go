@@ -231,6 +231,41 @@ func TestParseTrojan(t *testing.T) {
 	})
 }
 
+func TestParseHysteria2PortHopping(t *testing.T) {
+	t.Run("mport", func(t *testing.T) {
+		ob, _, err := parseHysteria2("hysteria2://pw@srv:443?mport=20000-50000,60000#h")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ob["server_port"] != 443 {
+			t.Fatalf("server_port = %v", ob["server_port"])
+		}
+		if got := fmt.Sprint(ob["server_ports"]); got != "[20000:50000 60000:60000]" {
+			t.Fatalf("server_ports = %s", got)
+		}
+	})
+	t.Run("ranges in place of the port", func(t *testing.T) {
+		ob, _, err := parseHysteria2("hy2://pw@[2001:db8::1]:20000-50000#h")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ob["server"] != "2001:db8::1" || ob["server_port"] != 20000 || fmt.Sprint(ob["server_ports"]) != "[20000:50000]" {
+			t.Fatalf("got %v", ob)
+		}
+	})
+	t.Run("absent and garbage", func(t *testing.T) {
+		ob, _, _ := parseHysteria2("hy2://pw@srv:443#h")
+		if _, has := ob["server_ports"]; has {
+			t.Fatal("server_ports set without hopping")
+		}
+		for _, bad := range []string{"abc", "50000-20000", "1-70000", ""} {
+			if hy2PortRanges(bad) != nil {
+				t.Fatalf("%q accepted", bad)
+			}
+		}
+	})
+}
+
 func TestParseHysteria2(t *testing.T) {
 	t.Run("basic", func(t *testing.T) {
 		ob, name, err := parseHysteria2("hy2://pass@example.com:8443?sni=foo.com#H")
