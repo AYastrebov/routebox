@@ -45,8 +45,10 @@ type userView struct {
 	// row cannot disagree with the reject rule the same numbers produce.
 	SuspendReason string `json:"suspend_reason"`
 	// Warning is set when the change was made but did not reach everywhere it
-	// had to — today, dest, which serves naive on its own. Omitted when empty,
-	// so every other answer keeps its shape.
+	// had to — dest, which serves naive on its own, or a reject rule the sweep
+	// could not put in force (a config draft is pending, the config is read-only,
+	// the reload failed). Omitted when empty, so every other answer keeps its
+	// shape.
 	Warning string `json:"warning,omitempty"`
 }
 
