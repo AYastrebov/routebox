@@ -1754,9 +1754,9 @@
     "trafficLoadFailed": "Failed to load traffic"
   },
   "awg": {
-    "statsNoteUnsupported": "This amnezia-box build cannot report per-peer handshake and traffic. Connection state is inferred from recorded traffic where possible, and byte counts are shown as “—”. Updating amnezia-box on the Updates page restores the real figures.",
-    "statsNoteUnreachable": "amnezia-box did not answer, so connection and traffic are shown as “—” rather than as zeros. This is normal for a few seconds after applying changes; if it persists, check that the proxy is running.",
-    "statsNoteNoSource": "Per-peer state is not being collected, so connection and traffic are shown as “—” rather than as zeros.",
+    "statsNoteUnsupported": "This amnezia-box build cannot report per-peer handshake state. Connection state is inferred from recorded traffic where possible and shown as “—” where it cannot be; the traffic counters keep the totals accumulated up to the last successful reading. Updating amnezia-box on the Updates page restores the live figures.",
+    "statsNoteUnreachable": "amnezia-box did not answer, so connection state and “last seen” are shown as “—” rather than as zeros; the traffic counters keep the totals from the last successful reading. This is normal for a few seconds after applying changes; if it persists, check that the proxy is running.",
+    "statsNoteNoSource": "Per-peer state is not being collected, so connection state and “last seen” are shown as “—” rather than as zeros; the traffic counters keep the totals accumulated up to the last successful reading.",
     "statsApproximate": "Inferred from recorded traffic — this amnezia-box cannot report per-peer state",
     "statsUnavailable": "Per-peer state could not be read",
     "title": "AmneziaWG",
@@ -1887,6 +1887,9 @@
     "quotaNoLimit": "no limit",
     "quotaHint": "The limit is checked every 30 s, so a small overshoot is normal. Empty or 0 = no limit.",
     "quotaUsed": "{used} of {quota} used",
+    "quotaInvalid": "Could not read the quota. Enter a number in GB (a dot for the decimals), or clear the field for no limit.",
+    "quotaNegative": "A quota cannot be negative. Clear the field or enter 0 for no limit.",
+    "quotaUnchanged": "Quota unchanged",
     "saveQuota": "Save quota",
     "quotaSaved": "Quota updated",
     "quotaFailed": "Failed to update quota",

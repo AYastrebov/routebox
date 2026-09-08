@@ -14,9 +14,15 @@ export interface QuotaPeer {
 }
 
 /**
- * GB (fractions allowed) -> whole bytes. Anything that is not a positive number
- * — empty input, NaN, a negative — is "no limit", i.e. 0: a negative is refused
- * by the API and must never be read here as "unlimited" by accident.
+ * GB (fractions allowed) -> whole bytes, for the API.
+ *
+ * Anything that is not a positive finite number — an empty field, NaN, a
+ * negative — comes back as 0, and 0 on the wire means REMOVE THE LIMIT. That is
+ * right for an empty field and wrong for a negative or for unparseable text, so
+ * the caller must refuse those BEFORE calling (saveQuota/addPeer do): this
+ * function cannot tell "the operator cleared the limit" from "the operator typed
+ * something the browser could not read", and silently turning the second into
+ * the first hands a client unlimited traffic under a success toast.
  */
 export function gbToBytes(gb: number): number {
 	if (!Number.isFinite(gb) || gb <= 0) return 0;
@@ -24,8 +30,11 @@ export function gbToBytes(gb: number): number {
 }
 
 /**
- * Bytes -> GB rounded to one decimal, for the number input (step 0.1) and any
- * GB-shaped label. 0 stays 0 ("no limit").
+ * Bytes -> GB rounded to one decimal. DISPLAY ONLY — never prefill an editable
+ * field with this: 1.25 GB comes back as 1.3, and an untouched Save would then
+ * write the rounded value over the stored one (a quota under 0.05 GB would come
+ * back as 0, i.e. no limit at all). The quota row prefills with the raw
+ * bytes / GB and compares in bytes.
  */
 export function bytesToGb(bytes: number): number {
 	if (!Number.isFinite(bytes) || bytes <= 0) return 0;

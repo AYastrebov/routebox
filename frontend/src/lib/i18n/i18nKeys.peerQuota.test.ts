@@ -12,6 +12,9 @@ const REQUIRED_KEYS = [
 	'awg.quotaNoLimit',
 	'awg.quotaHint',
 	'awg.quotaUsed',
+	'awg.quotaInvalid',
+	'awg.quotaNegative',
+	'awg.quotaUnchanged',
 	'awg.saveQuota',
 	'awg.quotaSaved',
 	'awg.quotaFailed',
@@ -56,6 +59,17 @@ describe('i18n: peer quota keys', () => {
 	it('suspendCheckHint names the 30 s tick in both locales', () => {
 		expect(lookup(en, 'awg.suspendCheckHint')).toContain('30 s');
 		expect(lookup(ru, 'awg.suspendCheckHint')).toContain('30 с');
+	});
+
+	// The roster shows the counters whatever the live snapshot said, so a note
+	// claiming traffic is dashed out would contradict the row it sits above (#95).
+	it('the degraded-stats notes no longer claim traffic is shown as a dash', () => {
+		for (const key of ['awg.statsNoteUnsupported', 'awg.statsNoteUnreachable', 'awg.statsNoteNoSource']) {
+			for (const loc of [en, ru]) {
+				const note = String(lookup(loc, key));
+				expect(note).toMatch(/traffic counters|счётчики трафика/);
+			}
+		}
 	});
 
 	// Every key suspendLabelKey can return must resolve, including the fallback.

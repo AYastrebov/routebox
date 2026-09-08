@@ -7,7 +7,7 @@
 	import type { AwgPeer } from '$lib/types';
 	import { formatBytes } from '$lib/stores/settings';
 	import { expiryStatus, unixToDateInput, dateInputToUnix, presetExpiry } from './peerExpiry';
-	import { gbToBytes, bytesToGb, quotaUsage, suspendLabelKey } from './peerQuota';
+	import { GB, gbToBytes, quotaUsage, suspendLabelKey } from './peerQuota';
 	import { copyText } from '$lib/utils/clipboard';
 
 	interface Props {
@@ -38,6 +38,13 @@
 	let quotaFor = $state<string | null>(null); // public_key of the peer whose quota row is open
 	let quotaGb = $state<number | null>(null); // GB bound to the number input (null/0 = no limit)
 	let savingQuota = $state(false);
+	// The elements, because the BINDINGS cannot tell the two ways of being empty
+	// apart: a number input holding text the browser could not parse ("1,5" on an
+	// English page in Firefox) binds as null, exactly like a cleared field — and a
+	// cleared field means "remove the limit". validity.badInput is the difference.
+	// Only one quota row is open at a time, so one ref is enough for the roster.
+	let quotaEl = $state<HTMLInputElement | null>(null);
+	let newQuotaEl = $state<HTMLInputElement | null>(null);
 	// Reset is destructive and lives in a row, so it confirms in the row: the
 	// first click arms it, the second does it (spec Q9). Holds the public_key so
 	// closing or switching rows disarms it on its own.
@@ -72,7 +79,9 @@
 	}
 	function openQuota(p: AwgPeer) {
 		quotaFor = p.public_key;
-		quotaGb = p.quota_bytes > 0 ? bytesToGb(p.quota_bytes) : null;
+		// Raw, NOT bytesToGb: rounding here would make an untouched Save rewrite
+		// the stored limit (1.25 GB -> 1.3, and anything under 0.05 GB -> 0 = none).
+		quotaGb = p.quota_bytes > 0 ? p.quota_bytes / GB : null;
 		renewing = null;
 		resetArmed = null;
 	}
@@ -95,10 +104,35 @@
 		}
 	}
 
+	// Every way of NOT having a number is refused before the PATCH, because 0 on
+	// the wire means "remove the limit": unparseable text and a negative would
+	// both hand the client unlimited traffic under a success toast.
+	function quotaInputRejected(el: HTMLInputElement | null, gb: number | null): boolean {
+		if (el?.validity.badInput) {
+			notifications.error($t('awg.quotaInvalid'));
+			return true;
+		}
+		if (gb !== null && gb < 0) {
+			notifications.error($t('awg.quotaNegative'));
+			return true;
+		}
+		return false;
+	}
+
 	async function saveQuota(p: AwgPeer) {
+		if (quotaInputRejected(quotaEl, quotaGb)) return;
+		const bytes = gbToBytes(quotaGb ?? 0);
+		// Compare in bytes, not in GB: the field shows the stored limit divided by
+		// 1024^3, and the operator who only came to look must not have their quota
+		// rewritten by the round-trip.
+		if (bytes === p.quota_bytes) {
+			notifications.info($t('awg.quotaUnchanged'));
+			quotaFor = null;
+			return;
+		}
 		savingQuota = true;
 		try {
-			await api.setAwgPeerLimits(p.public_key, { quota_bytes: gbToBytes(quotaGb ?? 0) });
+			await api.setAwgPeerLimits(p.public_key, { quota_bytes: bytes });
 			notifications.success($t('awg.quotaSaved'));
 			quotaFor = null;
 			await onChange();
@@ -184,6 +218,9 @@
 	async function addPeer() {
 		const name = newName.trim();
 		if (!name) return;
+		// Refuse before creating anything: a peer added with its quota silently
+		// dropped is a client with unlimited traffic and no sign that it happened.
+		if (quotaInputRejected(newQuotaEl, newQuotaGb)) return;
 		adding = true;
 		try {
 			const created = await api.createAwgPeer(name);
@@ -286,10 +323,11 @@
 	/>
 	<input
 		bind:value={newQuotaGb}
+		bind:this={newQuotaEl}
 		class="quota-input"
 		type="number"
 		min="0"
-		step="0.1"
+		step="any"
 		placeholder={$t('awg.quotaGbPlaceholder')}
 		title={$t('awg.quotaHint')}
 		onkeydown={(e) => e.key === 'Enter' && addPeer()}
@@ -449,10 +487,11 @@
 						<input
 							id="quota-{p.public_key}"
 							bind:value={quotaGb}
+							bind:this={quotaEl}
 							class="quota-input"
 							type="number"
 							min="0"
-							step="0.1"
+							step="any"
 							placeholder={$t('awg.quotaNoLimit')}
 						/>
 						<div class="quota-field-hint">{$t('awg.quotaHint')}</div>

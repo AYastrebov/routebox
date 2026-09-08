@@ -4,7 +4,8 @@ import { GB, gbToBytes, bytesToGb, quotaUsage, suspendLabelKey } from './peerQuo
 describe('gbToBytes', () => {
 	it('uses 1024^3, not 1000^3', () => expect(gbToBytes(1)).toBe(1_073_741_824));
 	it('accepts fractions', () => expect(gbToBytes(0.5)).toBe(GB / 2));
-	it('rounds to whole bytes', () => expect(Number.isInteger(gbToBytes(0.3))).toBe(true));
+	it('rounds to whole bytes, down when the fraction is below a half', () =>
+		expect(gbToBytes(0.3)).toBe(322_122_547)); // 0.3 * 1024^3 = 322122547.2
 	it('reads 0 as no limit', () => expect(gbToBytes(0)).toBe(0));
 	it('reads NaN (empty input) as no limit', () => expect(gbToBytes(NaN)).toBe(0));
 	it('never turns a negative into a limit', () => expect(gbToBytes(-5)).toBe(0));
@@ -13,6 +14,9 @@ describe('gbToBytes', () => {
 describe('bytesToGb', () => {
 	it('round-trips a whole GB', () => expect(bytesToGb(gbToBytes(10))).toBe(10));
 	it('rounds to one decimal', () => expect(bytesToGb(1.5678 * GB)).toBe(1.6));
+	// The reason it is display-only: 1.24 GB comes back as 1.2, and prefilling an
+	// editable field with that would rewrite the stored limit on an untouched Save.
+	it('rounds down at .04', () => expect(bytesToGb(1.24 * GB)).toBe(1.2));
 	it('keeps 0 as 0', () => expect(bytesToGb(0)).toBe(0));
 	it('reads a negative as 0', () => expect(bytesToGb(-1)).toBe(0));
 });
@@ -35,6 +39,16 @@ describe('quotaUsage', () => {
 	});
 	it('is exhausted exactly at the limit', () => {
 		expect(quotaUsage({ rx: 5 * GB, tx: 5 * GB, quota_bytes: 10 * GB }).exhausted).toBe(true);
+	});
+	// The bar rounds, the verdict does not: a peer 4 bytes short of its limit
+	// draws a full bar and is still in service.
+	it('draws a full bar just under the limit without calling it exhausted', () => {
+		const u = quotaUsage({ rx: 996, tx: 0, quota_bytes: 1000 });
+		expect(u.pct).toBe(100);
+		expect(u.exhausted).toBe(false);
+	});
+	it('rounds a fractional percentage to the nearest whole', () => {
+		expect(quotaUsage({ rx: 2, tx: 0, quota_bytes: 3 }).pct).toBe(67);
 	});
 	it('clamps the bar at 100% when over', () => {
 		const u = quotaUsage({ rx: 30 * GB, tx: 0, quota_bytes: 10 * GB });
