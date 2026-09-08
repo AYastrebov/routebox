@@ -29,7 +29,14 @@ func seedBackupStore(t *testing.T, m *Manager) (serverKey string, peer Peer) {
 	serverKey, _, _ = Generate(rand.Reader)
 	priv, pub, _ := Generate(rand.Reader)
 	psk, _ := GeneratePSK(rand.Reader)
-	peer = Peer{PublicKey: pub, PrivateKey: priv, PresharedKey: psk, Address: "10.10.0.2/32", Name: "phone", ExpiresAt: 42}
+	peer = Peer{
+		PublicKey: pub, PrivateKey: priv, PresharedKey: psk, Address: "10.10.0.2/32",
+		Name: "phone", ExpiresAt: 42,
+		// A peer carries its traffic limit and its spent bytes; #95 says a backup
+		// moves both, so a restored box does not hand a used-up client a fresh
+		// allowance (nor forget one it already granted).
+		QuotaBytes: 10 << 30, UsedRx: 1234, UsedTx: 5678, UsedResetAt: 1700000000,
+	}
 	if err := m.store.SetServerKey(serverKey); err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +76,10 @@ func TestBackupRoundTrip(t *testing.T) {
 	if back.Peers[0].PrivateKey != peer.PrivateKey || back.Peers[0].ExpiresAt != 42 {
 		t.Fatalf("peer secrets must survive JSON: %+v", back.Peers[0])
 	}
+	if q := back.Peers[0]; q.QuotaBytes != peer.QuotaBytes || q.UsedRx != peer.UsedRx ||
+		q.UsedTx != peer.UsedTx || q.UsedResetAt != peer.UsedResetAt {
+		t.Fatalf("quota and counters must survive JSON: %+v", q)
+	}
 
 	dst := newTestManager(t, newFakeRunner())
 	if err := dst.Restore(back); err != nil {
@@ -81,6 +92,10 @@ func TestBackupRoundTrip(t *testing.T) {
 	if !ok || got.PrivateKey != peer.PrivateKey || got.Address != peer.Address || got.Name != "phone" || got.ExpiresAt != 42 {
 		t.Fatalf("peer not restored: %+v ok=%v", got, ok)
 	}
+	if got.QuotaBytes != peer.QuotaBytes || got.UsedRx != peer.UsedRx ||
+		got.UsedTx != peer.UsedTx || got.UsedResetAt != peer.UsedResetAt {
+		t.Fatalf("quota and counters not restored: %+v", got)
+	}
 	// And it is on disk, not just in memory.
 	reload := NewStore(dst.store.GetPath())
 	if err := reload.Load(); err != nil {
@@ -88,6 +103,10 @@ func TestBackupRoundTrip(t *testing.T) {
 	}
 	if reload.ServerKey() != serverKey || len(reload.List()) != 1 {
 		t.Fatal("restore must persist to peers.toml")
+	}
+	if rp := reload.List()[0]; rp.QuotaBytes != peer.QuotaBytes || rp.UsedRx != peer.UsedRx ||
+		rp.UsedTx != peer.UsedTx || rp.UsedResetAt != peer.UsedResetAt {
+		t.Fatalf("quota and counters must round-trip through peers.toml: %+v", rp)
 	}
 }
 
@@ -165,6 +184,8 @@ func TestRestoreValidation(t *testing.T) {
 			b.Peers = append(b.Peers, p)
 		}, "address"},
 		{"negative expiry", func(b *Backup) { b.Peers[0].ExpiresAt = -1 }, "expires_at"},
+		{"negative quota", func(b *Backup) { b.Peers[0].QuotaBytes = -1 }, "quota_bytes"},
+		{"negative used", func(b *Backup) { b.Peers[0].UsedTx = -1 }, "used_rx"},
 		{"v4 ula", func(b *Backup) { b.ULAPrefix = "10.0.0.0/8" }, "ula_prefix"},
 		{"ula not /64", func(b *Backup) { b.ULAPrefix = "fd00::/48" }, "ula_prefix"},
 	}
@@ -250,7 +271,7 @@ func TestBackupWireFormat(t *testing.T) {
 		}
 	}
 	peer := m["peers"].([]any)[0].(map[string]any)
-	for _, k := range []string{"public_key", "private_key", "preshared_key", "address", "name", "created_at", "expires_at"} {
+	for _, k := range []string{"public_key", "private_key", "preshared_key", "address", "name", "created_at", "expires_at", "quota_bytes", "used_rx", "used_tx", "used_reset_at"} {
 		if _, ok := peer[k]; !ok {
 			t.Fatalf("missing peer key %q in %s", k, raw)
 		}

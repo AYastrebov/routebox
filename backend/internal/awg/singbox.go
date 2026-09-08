@@ -253,8 +253,8 @@ func (m *Manager) renderServerSpec() *config.AwgServerSpec {
 	now := m.store.now()
 	var peers []config.AwgServerPeer
 	for _, p := range m.store.List() {
-		if p.ExpiresAt != 0 && now >= p.ExpiresAt {
-			continue
+		if p.Suspended(now) {
+			continue // expired or over quota: the endpoint must not carry it
 		}
 		v6 := ""
 		if broker {

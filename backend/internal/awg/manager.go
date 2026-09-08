@@ -342,7 +342,7 @@ func (m *Manager) peerLines() []PeerLine {
 	peers := m.store.List()
 	out := make([]PeerLine, 0, len(peers))
 	for _, p := range peers {
-		if p.ExpiresAt != 0 && now >= p.ExpiresAt {
+		if p.Suspended(now) {
 			continue // suspended: keep it out of the conf so Enable/Apply can't resurrect it
 		}
 		out = append(out, PeerLine{Name: p.Name, PublicKey: p.PublicKey, PSK: p.PresharedKey, AllowedIP: p.Address})
@@ -907,9 +907,7 @@ func (m *Manager) RemovePeer(ctx context.Context, pub string) (string, error) {
 		// key back into service until the next tick noticed. Its store entry is
 		// already back — Delete rolls its own save failure back — and that is the
 		// whole of what it had.
-		now := m.store.now()
-		suspended := prev.ExpiresAt != 0 && now >= prev.ExpiresAt
-		if existed && !suspended {
+		if existed && !prev.Suspended(m.store.now()) {
 			if aerr := m.admit(ctx, prev); aerr != nil {
 				log.Printf("awg: peer %s could not be deleted from the store, and re-admitting it failed: %v (store: %v)", pub, aerr, err)
 			}
@@ -921,8 +919,14 @@ func (m *Manager) RemovePeer(ctx context.Context, pub string) (string, error) {
 
 // RenewPeer sets a peer's ExpiresAt and ensures it is admitted to the live
 // interface + conf. expiresAt is 0 (never) or a future unix ts (the handler
-// validates), so the peer is always active afterward; admit is idempotent, so this
-// is safe whether the peer was suspended or already live. ErrPeerNotFound if unknown.
+// validates); admit is idempotent, so this is safe whether the peer was suspended
+// or already live. ErrPeerNotFound if unknown.
+//
+// A peer suspended for a REASON THIS DOES NOT LIFT — a used-up traffic quota — is
+// not admitted: the date is stored, but the peer stays off the interface, exactly
+// where the sweep left it, until the quota is raised or the counter reset. Expiry
+// and quota are independent tools (spec Q16), so clearing one must not silently
+// clear the other.
 func (m *Manager) RenewPeer(ctx context.Context, pub string, expiresAt int64) error {
 	if _, err := ValidatePublicKey(pub); err != nil {
 		return err
@@ -949,6 +953,9 @@ func (m *Manager) RenewPeer(ctx context.Context, pub string, expiresAt int64) er
 		}
 		return nil
 	}
+	if p.Suspended(m.store.now()) {
+		return nil // still out of service on quota; the store now holds the new date
+	}
 	if err := m.admit(ctx, p); err != nil {
 		// Mirror of the singbox branch above. admit rolls its own changes back,
 		// so the interface and the .conf still carry the old expiry — and the
@@ -963,10 +970,10 @@ func (m *Manager) RenewPeer(ctx context.Context, pub string, expiresAt int64) er
 }
 
 // SweepExpired reconciles the live interface with the store, in both directions:
-// it suspends every peer whose ExpiresAt has passed (keeping its store secret for
-// later renewal) and strips every peer that is ours nowhere. Idempotent, and a
-// no-op when the interface is down (iface_ShowPeers errors → return). Run by the
-// sweep ticker.
+// it suspends every peer Peer.Suspended calls out — expiry passed, or traffic
+// quota used up — keeping its store secret for later renewal, and strips every
+// peer that is ours nowhere. Idempotent, and a no-op when the interface is down
+// (iface_ShowPeers errors → return). Run by the sweep ticker.
 //
 // It costs one `awg show` per tick even when nothing is expired — the earlier
 // early-out on an empty expiry set is what left the foreign-peer pass running
@@ -1051,18 +1058,19 @@ func (m *Manager) SweepExpired(ctx context.Context) {
 		return // interface down / not enabled — nothing to enforce now
 	}
 	now := m.store.now()
-	expired := map[string]bool{}
+	suspended := map[string]bool{}
 	for _, p := range m.store.List() {
-		if p.ExpiresAt != 0 && now >= p.ExpiresAt {
-			expired[p.PublicKey] = true
+		if p.Suspended(now) {
+			suspended[p.PublicKey] = true
 		}
 	}
-	// The expiry map is built from a store snapshot taken under addMu, and every
-	// writer of ExpiresAt (AddPeer/RemovePeer/RenewPeer) holds addMu too, so no
-	// peer can be renewed out from under this loop and be suspended anyway —
-	// off the interface with the store calling it active, which nothing heals.
+	// The suspension map is built from a store snapshot taken under addMu, and
+	// every writer of ExpiresAt/QuotaBytes (AddPeer/RemovePeer/RenewPeer) holds
+	// addMu too, so no peer can be renewed out from under this loop and be
+	// suspended anyway — off the interface with the store calling it active,
+	// which nothing heals.
 	for _, pub := range live {
-		if !expired[pub] {
+		if !suspended[pub] {
 			continue
 		}
 		if err := m.suspend(ctx, pub); err != nil {
@@ -1079,8 +1087,10 @@ func (m *Manager) SweepExpired(ctx context.Context) {
 }
 
 // usedFromStore returns the /32 host addresses of ALL stored peers (including
-// suspended ones, which are absent from the conf). Reserving these prevents a new
-// peer from grabbing a suspended peer's IP and breaking its later renewal.
+// suspended ones — expired or over quota — which are absent from the conf).
+// Reserving these prevents a new peer from grabbing a suspended peer's IP and
+// breaking its later renewal or quota top-up. Deliberately NOT filtered through
+// Peer.Suspended: the whole point is to cover the peers the renderers skip.
 func (m *Manager) usedFromStore() []netip.Addr {
 	var used []netip.Addr
 	for _, p := range m.store.List() {

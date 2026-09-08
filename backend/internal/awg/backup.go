@@ -134,6 +134,14 @@ func validateBackup(b Backup) error {
 		if p.ExpiresAt < 0 || p.CreatedAt < 0 {
 			return fmt.Errorf("peers[%d]: expires_at/created_at must not be negative", i)
 		}
+		// A negative limit would read as "no limit" and hand a capped client an
+		// unlimited one; negative counters would understate what it has spent.
+		if p.QuotaBytes < 0 {
+			return fmt.Errorf("peers[%d]: quota_bytes must not be negative", i)
+		}
+		if p.UsedRx < 0 || p.UsedTx < 0 || p.UsedResetAt < 0 {
+			return fmt.Errorf("peers[%d]: used_rx/used_tx/used_reset_at must not be negative", i)
+		}
 		addr, err := netip.ParsePrefix(p.Address)
 		if err != nil || !addr.Addr().Is4() || addr.Bits() != 32 {
 			return fmt.Errorf("peers[%d].address %q: want an IPv4 /32", i, p.Address)

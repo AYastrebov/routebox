@@ -8,6 +8,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"routebox/backend/internal/quota"
 	"routebox/backend/internal/util"
 )
 
@@ -21,7 +22,30 @@ type Peer struct {
 	Name         string `toml:"name" json:"name"`
 	CreatedAt    int64  `toml:"created_at" json:"created_at"`
 	ExpiresAt    int64  `toml:"expires_at" json:"expires_at"` // unix sec; 0 = never expires
+	// QuotaBytes is a one-off limit on rx+tx; 0 = no limit. UsedRx/UsedTx are
+	// cumulative byte counters the traffic ticker tops up with deltas, so they
+	// survive an interface restart (the live counters do not). UsedResetAt is
+	// when the counters were last zeroed (unix sec; 0 = never), for the "since …"
+	// caption. All four are absent from an old peers.toml and read back as 0,
+	// which is exactly "no limit, nothing used, never reset".
+	QuotaBytes  int64 `toml:"quota_bytes" json:"quota_bytes"`
+	UsedRx      int64 `toml:"used_rx" json:"used_rx"`
+	UsedTx      int64 `toml:"used_tx" json:"used_tx"`
+	UsedResetAt int64 `toml:"used_reset_at" json:"used_reset_at"`
 }
+
+// Suspension reports why the peer is out of service at now, or quota.ReasonNone
+// when it is in service. Peers have no manual on/off switch (that is a panel-user
+// thing), so enabled is always true here.
+func (p Peer) Suspension(now int64) quota.Reason {
+	return quota.State(p.QuotaBytes, p.UsedRx, p.UsedTx, true, p.ExpiresAt, now)
+}
+
+// Suspended is the one place the package asks "is this peer out of service?" —
+// expired, or over its traffic quota. Every renderer and sweep goes through it so
+// the two reasons can never drift apart (one keeping a peer in the .conf that the
+// other strips off the interface).
+func (p Peer) Suspended(now int64) bool { return p.Suspension(now) != quota.ReasonNone }
 
 // Store persists peer secrets to peers.toml (0600, dir 0700), atomically, mirroring
 // users/store.go. Keyed by PublicKey.
