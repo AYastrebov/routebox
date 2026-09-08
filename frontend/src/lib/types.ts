@@ -1183,8 +1183,14 @@ export interface AwgPeer {
 	// that predates that route.
 	last_handshake: number; // unix seconds; 0 = never
 	online: boolean;        // within the server's online window
-	rx: number;             // cumulative bytes received; meaningless unless stats === 'live'
-	tx: number;             // cumulative bytes sent; meaningless unless stats === 'live'
+	// The peer's own cumulative counters since `used_reset_at` (or since it was
+	// created), topped up from the live readings on the 30 s sweep and stored
+	// beside the peer — so they survive an interface or endpoint restart, unlike
+	// AwgStatus.rx/tx, which are live since the server came up. They are the
+	// numbers the quota is spent against (#95), and they stay meaningful when
+	// `stats` says the live snapshot could not be read this tick.
+	rx: number;             // cumulative bytes received since the last reset
+	tx: number;             // cumulative bytes sent since the last reset
 	/**
 	 * Where this row's numbers came from (#75). Without it, "never connected,
 	 * 0 B" reads the same whether it was measured or simply could not be read.
@@ -1202,6 +1208,15 @@ export interface AwgPeer {
 	 */
 	stats_reason?: 'unsupported' | 'unreachable' | 'no_source';
 	expires_at: number;     // unix seconds; 0 = never expires
+	quota_bytes: number;    // one-shot limit on rx + tx; 0 = no limit (#95)
+	used_reset_at: number;  // unix seconds the counters were last zeroed; 0 = never
+	/**
+	 * The ONE reason the peer is out of service, derived by the backend per
+	 * request (spec Q18) — never stored, so the roster cannot disagree with what
+	 * is actually served. Empty while the peer is in service. Not optional: this
+	 * comes from RouteBox itself, which ships in the same binary as this panel.
+	 */
+	suspend_reason: '' | 'quota' | 'expired';
 }
 
 // One AWG peer's traffic over a range, in the same shape /monitor/users renders

@@ -311,11 +311,19 @@ export const api = {
 	getAwgPeerVpnLink: (pk: string) => requestText(`/awg/peers/${encodeURIComponent(pk)}/vpn-link`),
 	getAwgPeerSingbox: (pk: string) =>
 		request<Record<string, unknown>>(`/awg/peers/${encodeURIComponent(pk)}/singbox`),
-	setAwgPeerExpiry: (pk: string, expiresAt: number) =>
+	// The peer's two limits, date and traffic quota (#95). They are independent
+	// and the panel saves them from two separate rows, so an OMITTED field keeps
+	// its stored value — never send `{expires_at: 0}` from the quota row, that
+	// would clear a date the row never showed.
+	setAwgPeerLimits: (pk: string, body: { expires_at?: number; quota_bytes?: number }) =>
 		requestRaw<void>(`/awg/peers/${encodeURIComponent(pk)}/expiry`, {
 			method: 'PATCH',
-			body: JSON.stringify({ expires_at: expiresAt })
+			body: JSON.stringify(body)
 		}),
+	// Zero the peer's cumulative counters and stamp used_reset_at. Keeps the
+	// limit — this is "start the allowance over", not "remove it".
+	resetAwgPeerTraffic: (pk: string) =>
+		requestRaw<void>(`/awg/peers/${encodeURIComponent(pk)}/traffic/reset`, { method: 'POST' }),
 	// Server backup/restore (#97): settings + peers.toml as one JSON file.
 	exportAwgBackup: () => {
 		window.location.href = '/api/awg/backup';

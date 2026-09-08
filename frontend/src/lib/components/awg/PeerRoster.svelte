@@ -7,6 +7,7 @@
 	import type { AwgPeer } from '$lib/types';
 	import { formatBytes } from '$lib/stores/settings';
 	import { expiryStatus, unixToDateInput, dateInputToUnix, presetExpiry } from './peerExpiry';
+	import { gbToBytes, bytesToGb, quotaUsage, suspendLabelKey } from './peerQuota';
 	import { copyText } from '$lib/utils/clipboard';
 
 	interface Props {
@@ -24,12 +25,24 @@
 	const isLive = (p: AwgPeer) => p.online;
 
 	let newName = $state('');
+	// Optional starting quota for a new peer, in GB (null = the field is empty =
+	// no limit). Separate from the date, because the two limits are (#95, Q16).
+	let newQuotaGb = $state<number | null>(null);
 	let adding = $state(false);
 
 	let renewing = $state<string | null>(null); // public_key of the peer whose renew row is open
 	let renewDate = $state(''); // YYYY-MM-DD bound to the date input (empty = never)
 	let savingExpiry = $state(false);
 	let dateEl = $state<HTMLInputElement | null>(null); // only one renew-row is open at a time
+
+	let quotaFor = $state<string | null>(null); // public_key of the peer whose quota row is open
+	let quotaGb = $state<number | null>(null); // GB bound to the number input (null/0 = no limit)
+	let savingQuota = $state(false);
+	// Reset is destructive and lives in a row, so it confirms in the row: the
+	// first click arms it, the second does it (spec Q9). Holds the public_key so
+	// closing or switching rows disarms it on its own.
+	let resetArmed = $state<string | null>(null);
+	let resetting = $state(false);
 
 	// Open the native date picker on click. showPicker() needs a user gesture (we have one);
 	// fall back to focus for the odd browser without it. ponytail: native picker, no lib.
@@ -49,17 +62,29 @@
 		return `${Math.max(1, Math.floor(s / 3600))}h`;
 	}
 
+	// The two limits have a row each and only one is open at a time: two open
+	// rows under one peer read as one form with two Save buttons.
 	function openRenew(p: AwgPeer) {
 		renewing = p.public_key;
 		renewDate = unixToDateInput(p.expires_at);
+		quotaFor = null;
+		resetArmed = null;
+	}
+	function openQuota(p: AwgPeer) {
+		quotaFor = p.public_key;
+		quotaGb = p.quota_bytes > 0 ? bytesToGb(p.quota_bytes) : null;
+		renewing = null;
+		resetArmed = null;
 	}
 	function applyPreset(days: number) {
 		renewDate = unixToDateInput(presetExpiry(days, nowSec()));
 	}
+	// Each row saves ONLY its own half: the omitted field keeps its stored value,
+	// so the quota row cannot clear a date it never showed (and vice versa).
 	async function saveExpiry(p: AwgPeer) {
 		savingExpiry = true;
 		try {
-			await api.setAwgPeerExpiry(p.public_key, dateInputToUnix(renewDate));
+			await api.setAwgPeerLimits(p.public_key, { expires_at: dateInputToUnix(renewDate) });
 			notifications.success($t('awg.expirySaved'));
 			renewing = null;
 			await onChange();
@@ -67,6 +92,34 @@
 			notifications.error(`${$t('awg.expiryFailed')}: ${e}`);
 		} finally {
 			savingExpiry = false;
+		}
+	}
+
+	async function saveQuota(p: AwgPeer) {
+		savingQuota = true;
+		try {
+			await api.setAwgPeerLimits(p.public_key, { quota_bytes: gbToBytes(quotaGb ?? 0) });
+			notifications.success($t('awg.quotaSaved'));
+			quotaFor = null;
+			await onChange();
+		} catch (e) {
+			notifications.error(`${$t('awg.quotaFailed')}: ${e}`);
+		} finally {
+			savingQuota = false;
+		}
+	}
+
+	async function resetTraffic(p: AwgPeer) {
+		resetting = true;
+		try {
+			await api.resetAwgPeerTraffic(p.public_key);
+			notifications.success($t('awg.trafficReset'));
+			resetArmed = null;
+			await onChange();
+		} catch (e) {
+			notifications.error(`${$t('awg.trafficResetFailed')}: ${e}`);
+		} finally {
+			resetting = false;
 		}
 	}
 
@@ -133,9 +186,22 @@
 		if (!name) return;
 		adding = true;
 		try {
-			await api.createAwgPeer(name);
+			const created = await api.createAwgPeer(name);
+			// The create route takes a name and nothing else, so a starting quota
+			// is a second call. It is reported separately on failure: the peer
+			// exists either way, and "add failed" would send the operator looking
+			// for a client that is already on the interface — without a limit.
+			const quota = gbToBytes(newQuotaGb ?? 0);
+			if (quota > 0) {
+				try {
+					await api.setAwgPeerLimits(created.public_key, { quota_bytes: quota });
+				} catch (e) {
+					notifications.error(`${$t('awg.quotaFailed')}: ${e}`);
+				}
+			}
 			notifications.success($t('awg.clientAdded', { values: { name } }));
 			newName = '';
+			newQuotaGb = null;
 			await onChange();
 		} catch (e) {
 			notifications.error(`${$t('awg.addFailed')}: ${e}`);
@@ -218,6 +284,16 @@
 		placeholder={$t('awg.newClientPlaceholder')}
 		onkeydown={(e) => e.key === 'Enter' && addPeer()}
 	/>
+	<input
+		bind:value={newQuotaGb}
+		class="quota-input"
+		type="number"
+		min="0"
+		step="0.1"
+		placeholder={$t('awg.quotaGbPlaceholder')}
+		title={$t('awg.quotaHint')}
+		onkeydown={(e) => e.key === 'Enter' && addPeer()}
+	/>
 	<button type="button" class="btn-add-client" onclick={addPeer} disabled={adding || !newName.trim()}>
 		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
 		{adding ? $t('awg.adding') : $t('awg.addClient')}
@@ -238,7 +314,11 @@
 {:else}
 	<div class="peer-list">
 		{#each peers as p (p.public_key)}
-			<div class="peer-row" class:dimmed={expiryStatus(p.expires_at, nowSec()) === 'suspended'}>
+			{@const usage = quotaUsage(p)}
+			<!-- Out of service is the SERVER's verdict now, not one this row
+			     recomputes: quota and date can both hold a peer back, and only the
+			     backend knows how many bytes the last sweep folded in (#95). -->
+			<div class="peer-row" class:dimmed={p.suspend_reason !== ''}>
 				<span class="icon-badge">
 					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20"><rect x="5" y="2" width="14" height="20" rx="2" /><line x1="12" y1="18" x2="12.01" y2="18" /></svg>
 				</span>
@@ -259,8 +339,9 @@
 									: $t('awg.offline')}
 						></span>
 						{p.name || '(unnamed)'}
-						{#if expiryStatus(p.expires_at, nowSec()) === 'suspended'}
-							<span class="susp-badge">{$t('awg.suspended')}</span>
+						<!-- One reason, the one to undo first (spec Q18). -->
+						{#if p.suspend_reason}
+							<span class="susp-badge" title={$t('awg.suspendCheckHint')}>{$t(suspendLabelKey(p))}</span>
 						{/if}
 					</div>
 					<div class="peer-meta">
@@ -270,12 +351,12 @@
 							{#if p.stats === 'unavailable'}—{:else}{isLive(p) ? $t('awg.online') : lastSeen(p.last_handshake)}{/if}
 						</span>
 						<span class="dot-sep">·</span>
-						<!-- Byte counts exist only on the live path. The fallback infers
-						     liveness from recorded traffic and has no counters at all, so
-						     printing 0 B there states a measurement nobody took (#75). -->
-						<span class="xfer" title={statsHint(p)}>
-							{#if p.stats && p.stats !== 'live'}—{:else}↓ {formatBytes(p.rx)} &nbsp;↑ {formatBytes(p.tx)}{/if}
-						</span>
+						<!-- The peer's own stored counters since the last reset (#95), not
+						     a live reading: they are shown whatever `stats` says, because a
+						     tick that could not read the interface leaves what was already
+						     accounted for intact. Only the dot and "last seen" above still
+						     depend on that snapshot (#75). -->
+						<span class="xfer" title={$t('awg.transferCumulative')}>↓ {formatBytes(p.rx)} &nbsp;↑ {formatBytes(p.tx)}</span>
 						{#if singbox}
 							<span class="dot-sep">·</span>
 							{#if !p.expires_at}
@@ -290,10 +371,25 @@
 							<span class="exp">{$t('awg.expires', { values: { date: unixToDateInput(p.expires_at) } })}</span>
 						{/if}
 					</div>
+					{#if usage.quota > 0}
+						<div class="quota-line">
+							<div class="quota-track">
+								<div class="quota-fill" class:over={usage.exhausted} style="width: {usage.pct}%"></div>
+							</div>
+							<span class="quota-text">
+								{$t('awg.quotaUsed', {
+									values: { used: formatBytes(usage.used), quota: formatBytes(usage.quota) }
+								})}
+							</span>
+						</div>
+					{/if}
 				</div>
 				<div class="peer-actions">
-					<button type="button" class="peer-btn {expiryStatus(p.expires_at, nowSec()) === 'suspended' ? 'primary' : ''}" onclick={() => openRenew(p)}>
+					<button type="button" class="peer-btn {p.suspend_reason === 'expired' ? 'primary' : ''}" onclick={() => openRenew(p)}>
 						{expiryStatus(p.expires_at, nowSec()) === 'none' ? $t('awg.setExpiry') : $t('awg.renew')}
+					</button>
+					<button type="button" class="peer-btn {p.suspend_reason === 'quota' ? 'primary' : ''}" onclick={() => openQuota(p)}>
+						{$t('awg.quota')}
 					</button>
 					{#if singbox}
 						<button type="button" class="peer-btn primary" onclick={() => showQR(p)}>
@@ -346,6 +442,33 @@
 					<button type="button" class="peer-btn" onclick={() => (renewing = null)}>{$t('awg.cancel')}</button>
 				</div>
 			{/if}
+			{#if quotaFor === p.public_key}
+				<div class="renew-row quota-row">
+					<div class="quota-field">
+						<label class="quota-label" for="quota-{p.public_key}">{$t('awg.quotaGb')}</label>
+						<input
+							id="quota-{p.public_key}"
+							bind:value={quotaGb}
+							class="quota-input"
+							type="number"
+							min="0"
+							step="0.1"
+							placeholder={$t('awg.quotaNoLimit')}
+						/>
+						<div class="quota-field-hint">{$t('awg.quotaHint')}</div>
+					</div>
+					<span class="renew-spacer"></span>
+					<button type="button" class="peer-btn primary" disabled={savingQuota} onclick={() => saveQuota(p)}>{$t('awg.saveQuota')}</button>
+					<button type="button" class="peer-btn" onclick={() => { quotaFor = null; resetArmed = null; }}>{$t('awg.cancel')}</button>
+					<!-- Destructive, so it confirms where it stands: first click arms,
+					     second click zeroes the counters (spec Q9). -->
+					{#if resetArmed === p.public_key}
+						<button type="button" class="peer-btn reset-confirm" disabled={resetting} onclick={() => resetTraffic(p)}>{$t('awg.resetCounterConfirm')}</button>
+					{:else}
+						<button type="button" class="peer-btn" onclick={() => (resetArmed = p.public_key)}>{$t('awg.resetCounter')}</button>
+					{/if}
+				</div>
+			{/if}
 		{/each}
 	</div>
 {/if}
@@ -391,8 +514,13 @@
 <style>
 	.add-row {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 0.6rem;
 		margin-bottom: 1rem;
+	}
+	/* The quota is optional and narrow — the name keeps the elastic width. */
+	.add-row .quota-input {
+		flex: 0 0 8.5rem;
 	}
 	.add-row input {
 		flex: 1;
@@ -566,6 +694,76 @@
 	}
 	.renew-spacer {
 		flex: 1;
+	}
+	/* Quota bar under the peer's meta line: thin, and only as wide as the text
+	   above it so it reads as part of the row, not as a page-wide progress bar. */
+	.quota-line {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-top: 5px;
+		max-width: 22rem;
+	}
+	.quota-track {
+		flex: 1;
+		height: 4px;
+		border-radius: 9999px;
+		background: var(--ctp-surface1);
+		overflow: hidden;
+	}
+	.quota-fill {
+		height: 100%;
+		border-radius: 9999px;
+		background: var(--ctp-primary);
+		transition: width 0.2s ease;
+	}
+	.quota-fill.over {
+		background: var(--ctp-red);
+	}
+	.quota-text {
+		color: var(--ctp-overlay1);
+		font-size: 0.75rem;
+		white-space: nowrap;
+	}
+	.quota-row {
+		align-items: flex-start;
+	}
+	.quota-field {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+	}
+	.quota-label {
+		color: var(--ctp-subtext1);
+		font-size: 0.8rem;
+	}
+	.quota-field-hint {
+		color: var(--ctp-overlay0);
+		font-size: 0.72rem;
+		max-width: 22rem;
+	}
+	.quota-input {
+		width: 7rem;
+		background: var(--ctp-base);
+		border: 1px solid var(--ctp-surface2);
+		border-radius: 0.375rem;
+		padding: 0.4rem 0.55rem;
+		color: var(--ctp-text);
+		font-size: 0.85rem;
+	}
+	.quota-input:focus {
+		outline: none;
+		border-color: var(--ctp-primary);
+	}
+	.reset-confirm {
+		border-color: var(--ctp-red);
+		color: var(--ctp-red);
+		background: color-mix(in srgb, var(--ctp-red) 12%, transparent);
+	}
+	.reset-confirm:hover {
+		border-color: var(--ctp-red);
+		color: var(--ctp-red);
+		background: color-mix(in srgb, var(--ctp-red) 22%, transparent);
 	}
 	.peer-actions {
 		display: flex;
