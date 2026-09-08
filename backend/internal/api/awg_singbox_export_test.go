@@ -28,6 +28,7 @@ func newSingboxAWGHandler(t *testing.T) (*Handler, http.Handler) {
 		r.Post("/peers", h.CreateAWGPeer)
 		r.Delete("/peers/{publicKey}", h.DeleteAWGPeer)
 		r.Patch("/peers/{publicKey}/expiry", h.SetAWGPeerExpiry)
+		r.Post("/peers/{publicKey}/traffic/reset", h.ResetAWGPeerTraffic)
 	})
 	return h, r
 }
@@ -121,6 +122,8 @@ func TestAWGPeerOpsSingboxPendingDraftIs409(t *testing.T) {
 		{http.MethodPost, "/api/awg/peers", `{"name":"drafty"}`},
 		{http.MethodDelete, "/api/awg/peers/" + knownPub, ""},
 		{http.MethodPatch, "/api/awg/peers/" + knownPub + "/expiry", `{"expires_at":0}`},
+		{http.MethodPatch, "/api/awg/peers/" + knownPub + "/expiry", `{"quota_bytes":1024}`},
+		{http.MethodPost, "/api/awg/peers/" + knownPub + "/traffic/reset", ""},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()

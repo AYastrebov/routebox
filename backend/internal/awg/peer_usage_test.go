@@ -278,28 +278,6 @@ func TestSetPeerLimitsLoweringQuotaSuspendsImmediately(t *testing.T) {
 	}
 }
 
-// RenewPeer is the back-compat wrapper: it must keep the peer's quota untouched
-// while it moves the date (spec Q16 — two independent tools).
-func TestRenewPeerKeepsQuota(t *testing.T) {
-	ctx := context.Background()
-	f := newFakeRunner()
-	m := newTestManager(t, f)
-	seedConf(t, m)
-	m.store.now = func() int64 { return 1000 }
-	seedUsagePeer(t, m, Peer{
-		PublicKey: validPub, PresharedKey: "psk", Address: "10.10.0.2/32", Name: "bob",
-		ExpiresAt: 500, QuotaBytes: 4096, UsedRx: 10,
-	})
-
-	if err := m.RenewPeer(ctx, validPub, 5000); err != nil {
-		t.Fatalf("RenewPeer: %v", err)
-	}
-	got, _ := m.store.Get(validPub)
-	if got.ExpiresAt != 5000 || got.QuotaBytes != 4096 || got.UsedRx != 10 {
-		t.Fatalf("renewal must move only the date: %+v", got)
-	}
-}
-
 // Q9/Q19: resetting the counter zeroes it, stamps the reset moment, and returns
 // the peer to service in the same call.
 func TestResetPeerUsageZeroesAndAdmits(t *testing.T) {

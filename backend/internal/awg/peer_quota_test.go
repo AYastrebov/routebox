@@ -110,7 +110,7 @@ func TestSweepExpiredSuspendsQuotaExhaustedPeer(t *testing.T) {
 
 // Expiry and quota are independent (spec Q16): extending the date of a peer that
 // has spent its allowance must not put it back on the interface.
-func TestRenewPeerDoesNotReadmitQuotaExhausted(t *testing.T) {
+func TestSetPeerLimitsDoesNotReadmitQuotaExhausted(t *testing.T) {
 	f := newFakeRunner()
 	m := newTestManager(t, f)
 	seedConf(t, m)
@@ -120,8 +120,8 @@ func TestRenewPeerDoesNotReadmitQuotaExhausted(t *testing.T) {
 		ExpiresAt: 500, QuotaBytes: 1024, UsedRx: 2048,
 	})
 
-	if err := m.RenewPeer(context.Background(), validPub, 5000); err != nil {
-		t.Fatalf("RenewPeer: %v", err)
+	if err := m.SetPeerLimits(context.Background(), validPub, 5000, 1024); err != nil {
+		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	if got, _ := m.store.Get(validPub); got.ExpiresAt != 5000 {
 		t.Fatalf("the new date must still be stored: %+v", got)

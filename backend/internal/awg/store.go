@@ -308,7 +308,7 @@ func (s *Store) listLocked() []Peer {
 // Reconcile reports which peers of the LIVE interface are not ours. "Ours" is
 // the store, whole: a suspended (expired) peer is intentionally absent from the
 // conf (peerLines skips it so Enable/Apply cannot resurrect it) yet stays in the
-// store, and its secrets MUST survive reconcile — otherwise RenewPeer becomes
+// store, and its secrets MUST survive reconcile — otherwise renewal becomes
 // impossible for every expired client.
 //
 // It used to take the conf's pubkeys as well and treat "ours" as the union. That

@@ -230,7 +230,7 @@ func TestSingbox_ExpiredPeerOmittedFromSpec(t *testing.T) {
 	m.AddPeer(context.Background(), "bob")
 	pk := fs.lastSpec.Peers[0].PublicKey
 	// Expire it in the past and re-sync.
-	m.RenewPeer(context.Background(), pk, 1) // unix ts 1 = long past
+	m.SetPeerLimits(context.Background(), pk, 1, 0) // unix ts 1 = long past
 	if len(fs.lastSpec.Peers) != 0 {
 		t.Fatalf("expired peer must be omitted from spec, got %d", len(fs.lastSpec.Peers))
 	}

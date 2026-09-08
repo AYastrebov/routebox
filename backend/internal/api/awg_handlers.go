@@ -344,9 +344,19 @@ func (h *Handler) GetAWGPeerSingbox(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, ep)
 }
 
-// SetAWGPeerExpiry sets/extends/clears a peer's expiry (one operation backed by
-// RenewPeer, which also re-admits a suspended peer). Body: {"expires_at": <unix|0>}.
-// 0 clears expiry; a non-zero value must be strictly in the future.
+// SetAWGPeerExpiry writes a peer's two limits — the expiry date and the traffic
+// quota (#95). Body: {"expires_at": <unix|0>, "quota_bytes": <bytes>}; BOTH
+// fields are optional and an omitted one keeps its stored value, because the
+// panel drives them from two independent rows ("Продлить" and "Квота", spec
+// Q16/Q22) and each must be able to save alone. expires_at 0 clears the date, a
+// non-zero one must be strictly in the future; quota_bytes 0 clears the limit and
+// a negative value is refused rather than read as "no limit".
+//
+// The verdict lands at save time, not at the next sweep (spec Q19/Q20): raising a
+// limit or extending a date re-admits a peer that has nothing else holding it
+// back, lowering the quota below what is already spent suspends it now. It is NOT
+// a plain re-admit any more — a peer over its quota stays off the interface
+// however far its date is moved, which is exactly what makes the two independent.
 func (h *Handler) SetAWGPeerExpiry(w http.ResponseWriter, r *http.Request) {
 	if h.awg == nil {
 		writeError(w, http.StatusServiceUnavailable, "awg not available")
@@ -361,23 +371,81 @@ func (h *Handler) SetAWGPeerExpiry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid public key")
 		return
 	}
+	// Pointers, so "field absent" is distinguishable from "field set to 0" — 0 is
+	// a meaningful value for both (no expiry / no limit), and a quota row that
+	// omitted expires_at would otherwise clear the date it never showed.
 	var body struct {
-		ExpiresAt int64 `json:"expires_at"`
+		ExpiresAt  *int64 `json:"expires_at"`
+		QuotaBytes *int64 `json:"quota_bytes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if body.ExpiresAt != 0 && body.ExpiresAt <= time.Now().Unix() {
+	if body.ExpiresAt != nil && *body.ExpiresAt != 0 && *body.ExpiresAt <= time.Now().Unix() {
 		writeError(w, http.StatusBadRequest, "expires_at must be 0 or in the future")
 		return
 	}
-	if err := h.awg.RenewPeer(r.Context(), pub, body.ExpiresAt); err != nil {
+	if body.QuotaBytes != nil && *body.QuotaBytes < 0 {
+		writeError(w, http.StatusBadRequest, "quota_bytes must be >= 0 (0 = no limit)")
+		return
+	}
+	// Fill the omitted half from the store. Both limits travel to SetPeerLimits
+	// together (it writes them under the same lock the sweep uses), so the peer
+	// has to be read first; the read is outside that lock, but the only writers
+	// of these two fields are operator actions, and two of those racing on the
+	// same peer is a person fighting themselves.
+	p, ok := h.awg.Store().Get(pub)
+	if !ok {
+		writeError(w, http.StatusNotFound, "peer not found")
+		return
+	}
+	expiresAt, quotaBytes := p.ExpiresAt, p.QuotaBytes
+	if body.ExpiresAt != nil {
+		expiresAt = *body.ExpiresAt
+	}
+	if body.QuotaBytes != nil {
+		quotaBytes = *body.QuotaBytes
+	}
+	if err := h.awg.SetPeerLimits(r.Context(), pub, expiresAt, quotaBytes); err != nil {
 		if errors.Is(err, awg.ErrPeerNotFound) {
 			writeError(w, http.StatusNotFound, "peer not found")
 			return
 		}
-		writeOpError(w, http.StatusInternalServerError, "failed to set expiry", err)
+		writeOpError(w, http.StatusInternalServerError, "failed to set peer limits", err)
+		return
+	}
+	writeSuccess(w, h.awg.Status(r.Context()))
+}
+
+// ResetAWGPeerTraffic zeroes a peer's cumulative quota counters, stamps
+// used_reset_at and puts the peer back in service when the spent allowance was
+// what suspended it (spec Q9/Q19) — the "Сбросить счётчик" button. The limit
+// itself is kept: raising it is the other, separate way back.
+//
+// Same draft guard as the limits PATCH: on the singbox backend the re-admit
+// rewrites the ACTIVE config, which SyncAwgEndpointActive silently defers while a
+// draft is pending. Answers with Status, like every other peer op.
+func (h *Handler) ResetAWGPeerTraffic(w http.ResponseWriter, r *http.Request) {
+	if h.awg == nil {
+		writeError(w, http.StatusServiceUnavailable, "awg not available")
+		return
+	}
+	if h.awgSingboxDraftBlocked() {
+		writeError(w, http.StatusConflict, "apply or discard pending config changes first")
+		return
+	}
+	pub, err := awgPubKeyParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid public key")
+		return
+	}
+	if err := h.awg.ResetPeerUsage(r.Context(), pub); err != nil {
+		if errors.Is(err, awg.ErrPeerNotFound) {
+			writeError(w, http.StatusNotFound, "peer not found")
+			return
+		}
+		writeOpError(w, http.StatusInternalServerError, "failed to reset traffic counters", err)
 		return
 	}
 	writeSuccess(w, h.awg.Status(r.Context()))

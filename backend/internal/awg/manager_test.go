@@ -138,11 +138,11 @@ func seedConf(t *testing.T, m *Manager) {
 }
 
 // validPub / otherValidPub are real 32-byte std-base64 keys (ValidatePublicKey is a
-// 32-byte-decode length check), required because RenewPeer validates its pub arg.
+// 32-byte-decode length check), required because SetPeerLimits validates its pub arg.
 const validPub = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEs="
 const otherValidPub = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI="
 
-func TestRenewPeerReadmitsSuspended(t *testing.T) {
+func TestSetPeerLimitsReadmitsSuspended(t *testing.T) {
 	f := newFakeRunner()
 	m := newTestManager(t, f)
 	seedConf(t, m)
@@ -150,8 +150,8 @@ func TestRenewPeerReadmitsSuspended(t *testing.T) {
 	// a suspended peer: expired, off the conf, secret retained
 	_ = m.store.Put(Peer{PublicKey: validPub, PresharedKey: "psk", Address: "10.10.0.2/32", Name: "bob", ExpiresAt: 500})
 
-	if err := m.RenewPeer(context.Background(), validPub, 5000); err != nil {
-		t.Fatalf("RenewPeer: %v", err)
+	if err := m.SetPeerLimits(context.Background(), validPub, 5000, 0); err != nil {
+		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	// stored expiry updated
 	got, _ := m.store.Get(validPub)
@@ -169,10 +169,10 @@ func TestRenewPeerReadmitsSuspended(t *testing.T) {
 	}
 }
 
-func TestRenewPeerUnknown(t *testing.T) {
+func TestSetPeerLimitsUnknown(t *testing.T) {
 	m := newTestManager(t, newFakeRunner())
 	seedConf(t, m)
-	if err := m.RenewPeer(context.Background(), otherValidPub, 5000); err != ErrPeerNotFound {
+	if err := m.SetPeerLimits(context.Background(), otherValidPub, 5000, 0); err != ErrPeerNotFound {
 		t.Fatalf("want ErrPeerNotFound, got %v", err)
 	}
 }
@@ -217,7 +217,7 @@ func TestSweepExpiredSkipsRenewedPeer(t *testing.T) {
 
 	// A renewal that lands just before the sweep looks must be honoured, or the
 	// peer ends up off the interface with the store calling it active — a state
-	// nothing heals. RenewPeer writes the new expiry under addMu, so holding the
+	// nothing heals. SetPeerLimits writes the new expiry under addMu, so holding the
 	// lock here reproduces the ordering the real thing is forced into: the sweep
 	// cannot read the store until the renewal is in it.
 	m.addMu.Lock()
@@ -242,7 +242,7 @@ func TestSweepExpiredSkipsRenewedPeer(t *testing.T) {
 	}
 }
 
-func TestRenewPeerNoDuplicateConfBlock(t *testing.T) {
+func TestSetPeerLimitsNoDuplicateConfBlock(t *testing.T) {
 	f := newFakeRunner()
 	m := newTestManager(t, f)
 	seedConf(t, m)
@@ -251,8 +251,8 @@ func TestRenewPeerNoDuplicateConfBlock(t *testing.T) {
 	_ = m.store.Put(Peer{PublicKey: validPub, PresharedKey: "psk", Address: "10.10.0.2/32", Name: "bob", ExpiresAt: 5000})
 	m.appendPeerToConf(PeerLine{Name: "bob", PublicKey: validPub, PSK: "psk", AllowedIP: "10.10.0.2/32"})
 
-	if err := m.RenewPeer(context.Background(), validPub, 9000); err != nil {
-		t.Fatalf("RenewPeer: %v", err)
+	if err := m.SetPeerLimits(context.Background(), validPub, 9000, 0); err != nil {
+		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	data, _ := os.ReadFile(m.confPath)
 	if n := strings.Count(string(data), "PublicKey = "+validPub); n != 1 {

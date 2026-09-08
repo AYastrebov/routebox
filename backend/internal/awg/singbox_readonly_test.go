@@ -48,7 +48,7 @@ func TestSingbox_RemovePeer_ReadOnlyConfigKeepsTheSecret(t *testing.T) {
 	}
 }
 
-func TestSingbox_RenewPeer_ReadOnlyConfigKeepsTheOldExpiry(t *testing.T) {
+func TestSingbox_SetPeerLimits_ReadOnlyConfigKeepsTheOldExpiry(t *testing.T) {
 	m, fs, _ := newSingboxMgr(t)
 	sum, err := m.AddPeer(context.Background(), "alice")
 	if err != nil {
@@ -56,8 +56,8 @@ func TestSingbox_RenewPeer_ReadOnlyConfigKeepsTheOldExpiry(t *testing.T) {
 	}
 	fs.err = errRO()
 
-	if err := m.RenewPeer(context.Background(), sum.PublicKey, 4102444800); err == nil {
-		t.Fatal("RenewPeer must fail when the endpoint cannot be rewritten")
+	if err := m.SetPeerLimits(context.Background(), sum.PublicKey, 4102444800, 0); err == nil {
+		t.Fatal("SetPeerLimits must fail when the endpoint cannot be rewritten")
 	}
 	p, ok := m.store.Get(sum.PublicKey)
 	if !ok {

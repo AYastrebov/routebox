@@ -7,12 +7,12 @@ import (
 	"testing"
 )
 
-// RenewPeer writes the new expiry to the store BEFORE it re-admits the peer.
+// SetPeerLimits writes the new limits to the store BEFORE it re-admits the peer.
 // The singbox branch compensates when the sync fails; the kernel branch just
 // returned admit's error, leaving the store — and therefore the panel — showing
 // a renewal that never reached the interface or the .conf. The sweep does not
 // heal it either: it only suspends peers whose expiry has passed.
-func TestKernelRenewPeerRestoresTheExpiryWhenAdmitFails(t *testing.T) {
+func TestKernelSetPeerLimitsRestoresTheExpiryWhenAdmitFails(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeRunner()
 	m := newTestManager(t, f)
@@ -42,8 +42,8 @@ func TestKernelRenewPeerRestoresTheExpiryWhenAdmitFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := m.RenewPeer(ctx, sum.PublicKey, 4102444800); err == nil {
-		t.Fatal("RenewPeer must fail when the peer cannot be re-admitted")
+	if err := m.SetPeerLimits(ctx, sum.PublicKey, 4102444800, 0); err == nil {
+		t.Fatal("SetPeerLimits must fail when the peer cannot be re-admitted")
 	}
 
 	got, ok := m.store.Get(sum.PublicKey)
@@ -56,7 +56,7 @@ func TestKernelRenewPeerRestoresTheExpiryWhenAdmitFails(t *testing.T) {
 }
 
 // The happy path still persists the new expiry.
-func TestKernelRenewPeerKeepsTheNewExpiryOnSuccess(t *testing.T) {
+func TestKernelSetPeerLimitsKeepsTheNewExpiryOnSuccess(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeRunner()
 	m := newTestManager(t, f)
@@ -71,7 +71,7 @@ func TestKernelRenewPeerKeepsTheNewExpiryOnSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	const until = int64(4102444800)
-	if err := m.RenewPeer(ctx, sum.PublicKey, until); err != nil {
+	if err := m.SetPeerLimits(ctx, sum.PublicKey, until, 0); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := m.store.Get(sum.PublicKey)

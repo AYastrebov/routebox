@@ -324,7 +324,8 @@ type Manager struct {
 // ErrSubnetExhausted is returned by AddPeer when no /32 host remains free.
 var ErrSubnetExhausted = fmt.Errorf("subnet exhausted")
 
-// ErrPeerNotFound is returned by RenewPeer when the pubkey has no stored secret.
+// ErrPeerNotFound is returned by SetPeerLimits/ResetPeerUsage when the pubkey has
+// no stored secret.
 var ErrPeerNotFound = fmt.Errorf("peer not found")
 
 // Config seeds a Manager's non-runtime fields (canonical values are otherwise
@@ -892,7 +893,8 @@ func joinHostPort(host string, port int) string {
 // admit applies a peer to the live interface and writes its [Peer] block to the
 // conf (idempotent: any existing block for the same key is replaced, so calling it
 // on an already-live peer cannot duplicate the stanza). Shared by AddPeer (new
-// peer) and RenewPeer (re-admitting a suspended peer from its stored secret).
+// peer) and SetPeerLimits/ResetPeerUsage (re-admitting a suspended peer from its
+// stored secret).
 // Caller holds m.addMu.
 func (m *Manager) admit(ctx context.Context, p Peer) error {
 	pskFile := filepath.Join(m.pskTmpDir, strconv.FormatInt(time.Now().UnixNano(), 10)+".psk")
@@ -986,22 +988,6 @@ func (m *Manager) RemovePeer(ctx context.Context, pub string) (string, error) {
 		return "", err
 	}
 	return addr, nil
-}
-
-// RenewPeer sets a peer's ExpiresAt, leaving its traffic limit as it is. Kept as
-// a thin wrapper over SetPeerLimits so the existing expiry handler keeps working
-// while the quota field is being wired through the API.
-//
-// The quota read here is outside addMu, so a limit change landing in the same
-// instant could be written back unchanged. Harmless for the one caller left (the
-// expiry endpoint, driven by a human), and gone the moment that endpoint passes
-// both limits through SetPeerLimits itself.
-func (m *Manager) RenewPeer(ctx context.Context, pub string, expiresAt int64) error {
-	quotaBytes := int64(0)
-	if p, ok := m.store.Get(pub); ok {
-		quotaBytes = p.QuotaBytes
-	}
-	return m.SetPeerLimits(ctx, pub, expiresAt, quotaBytes)
 }
 
 // SetPeerLimits writes BOTH of a peer's limits — the expiry date and the traffic
@@ -1363,7 +1349,7 @@ func (m *Manager) SweepExpired(ctx context.Context) {
 		}
 	}
 	// The suspension map is built from a store snapshot taken under addMu, and
-	// every writer of ExpiresAt/QuotaBytes (AddPeer/RemovePeer/RenewPeer) holds
+	// every writer of ExpiresAt/QuotaBytes (AddPeer/RemovePeer/SetPeerLimits) holds
 	// addMu too, so no peer can be renewed out from under this loop and be
 	// suspended anyway — off the interface with the store calling it active,
 	// which nothing heals.

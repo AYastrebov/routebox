@@ -12,7 +12,7 @@ import (
 
 // A suspended (expired) peer is intentionally absent from the conf — peerLines
 // skips it so Enable/Apply cannot resurrect it. Reconcile must therefore never
-// treat "absent from conf" as "delete the secret", or RenewPeer becomes
+// treat "absent from conf" as "delete the secret", or renewal becomes
 // impossible for every expired client.
 func TestReconcileKeepsSuspendedPeers(t *testing.T) {
 	s := newTestStore(t)

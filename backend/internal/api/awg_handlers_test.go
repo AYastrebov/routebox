@@ -98,6 +98,7 @@ func newAWGTestHandler(t *testing.T) (*Handler, http.Handler) {
 		r.Get("/peers/{publicKey}/config", h.GetAWGPeerConfig)
 		r.Get("/peers/{publicKey}/vpn-link", h.GetAWGPeerVPNLink)
 		r.Patch("/peers/{publicKey}/expiry", h.SetAWGPeerExpiry)
+		r.Post("/peers/{publicKey}/traffic/reset", h.ResetAWGPeerTraffic)
 		r.Get("/backup", h.GetAWGBackup)
 		r.Post("/restore", h.RestoreAWGBackup)
 	})
@@ -829,5 +830,202 @@ func TestAWGListenPortIsFreeWithoutTheDeploymentVariable(t *testing.T) {
 	}
 	if got := h.settings.Get().Awg.ListenPort; got != 51821 {
 		t.Fatalf("listen port = %d, want 51821", got)
+	}
+}
+
+// --- traffic quota (#95) -----------------------------------------------------
+
+// awgPeerRow reads one roster row back through GET /api/awg/peers — the same
+// answer the panel draws from — so the quota assertions below pin the wire shape
+// (rx/tx cumulative, quota_bytes, used_reset_at, suspend_reason), not the store.
+type awgPeerRow struct {
+	PublicKey     string `json:"public_key"`
+	Rx            int64  `json:"rx"`
+	Tx            int64  `json:"tx"`
+	ExpiresAt     int64  `json:"expires_at"`
+	QuotaBytes    int64  `json:"quota_bytes"`
+	UsedResetAt   int64  `json:"used_reset_at"`
+	SuspendReason string `json:"suspend_reason"`
+}
+
+func peerRow(t *testing.T, r http.Handler, pub string) awgPeerRow {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/awg/peers", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list peers = %d; body=%q", rec.Code, rec.Body.String())
+	}
+	var env struct {
+		Data []awgPeerRow `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode roster: %v; body=%q", err, rec.Body.String())
+	}
+	for _, row := range env.Data {
+		if row.PublicKey == pub {
+			return row
+		}
+	}
+	t.Fatalf("peer %s not in roster: %s", pub, rec.Body.String())
+	return awgPeerRow{}
+}
+
+// seedQuotaPeer replaces the harness peer with one carrying limits and spent
+// bytes (Store.Put writes the struct whole, so the secrets are restated).
+func seedQuotaPeer(t *testing.T, h *Handler, p awg.Peer) {
+	t.Helper()
+	p.PublicKey, p.PrivateKey, p.PresharedKey = knownPub, knownPriv, knownPSK
+	if p.Address == "" {
+		p.Address = "10.10.0.2/32"
+	}
+	if p.Name == "" {
+		p.Name = "phone"
+	}
+	if err := h.awg.Store().Put(p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func patchLimits(t *testing.T, r http.Handler, pub, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch,
+		"/api/awg/peers/"+pub+"/expiry", strings.NewReader(body)))
+	return rec
+}
+
+// Spec Q16/Q22: the two limits are independent controls with their own rows, so
+// a quota-only save must leave the date exactly where the "Продлить" row put it.
+func TestSetAWGPeerQuotaOnlyKeepsExpiry(t *testing.T) {
+	h, r := newAWGTestHandler(t)
+	future := time.Now().Add(48 * time.Hour).Unix()
+	seedQuotaPeer(t, h, awg.Peer{ExpiresAt: future})
+
+	if rec := patchLimits(t, r, knownPub, `{"quota_bytes":1048576}`); rec.Code != http.StatusOK {
+		t.Fatalf("quota-only patch = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	got := peerRow(t, r, knownPub)
+	if got.QuotaBytes != 1048576 || got.ExpiresAt != future {
+		t.Fatalf("quota-only patch must move only the quota: %+v", got)
+	}
+}
+
+// The mirror image: the existing expiry row sends only expires_at, and the peer's
+// allowance must survive it (this is what RenewPeer used to guarantee).
+func TestSetAWGPeerExpiryOnlyKeepsQuota(t *testing.T) {
+	h, r := newAWGTestHandler(t)
+	seedQuotaPeer(t, h, awg.Peer{QuotaBytes: 4096, UsedRx: 10})
+	future := time.Now().Add(48 * time.Hour).Unix()
+
+	rec := patchLimits(t, r, knownPub, fmt.Sprintf(`{"expires_at":%d}`, future))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expiry-only patch = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	got := peerRow(t, r, knownPub)
+	if got.ExpiresAt != future || got.QuotaBytes != 4096 || got.Rx != 10 {
+		t.Fatalf("expiry-only patch must move only the date: %+v", got)
+	}
+}
+
+// An empty body is a no-op, not a wipe: both fields omitted keeps both limits.
+func TestSetAWGPeerLimitsEmptyBodyChangesNothing(t *testing.T) {
+	h, r := newAWGTestHandler(t)
+	future := time.Now().Add(48 * time.Hour).Unix()
+	seedQuotaPeer(t, h, awg.Peer{ExpiresAt: future, QuotaBytes: 4096})
+
+	if rec := patchLimits(t, r, knownPub, `{}`); rec.Code != http.StatusOK {
+		t.Fatalf("empty patch = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	got := peerRow(t, r, knownPub)
+	if got.ExpiresAt != future || got.QuotaBytes != 4096 {
+		t.Fatalf("an omitted field must keep its stored value: %+v", got)
+	}
+}
+
+// Negative is refused rather than read as "no limit" (0), so a UI bug cannot
+// silently turn a limit off — same rule as the panel user's quota_bytes.
+func TestSetAWGPeerQuotaNegativeIs400(t *testing.T) {
+	h, r := newAWGTestHandler(t)
+	seedQuotaPeer(t, h, awg.Peer{QuotaBytes: 4096})
+
+	rec := patchLimits(t, r, knownPub, `{"quota_bytes":-1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("negative quota = %d; want 400; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := peerRow(t, r, knownPub); got.QuotaBytes != 4096 {
+		t.Fatalf("a rejected patch must not have written anything: %+v", got)
+	}
+}
+
+// Spec Q19/Q20: the verdict lands at save time. Lowering below what is spent
+// suspends immediately (reason "quota", not "expired"), raising re-admits.
+func TestSetAWGPeerQuotaSuspendsAndReadmitsImmediately(t *testing.T) {
+	h, r := newAWGTestHandler(t)
+	seedQuotaPeer(t, h, awg.Peer{UsedRx: 600, UsedTx: 600})
+
+	if rec := patchLimits(t, r, knownPub, `{"quota_bytes":1000}`); rec.Code != http.StatusOK {
+		t.Fatalf("lowering = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := peerRow(t, r, knownPub); got.SuspendReason != "quota" {
+		t.Fatalf("spent peer must be suspended on quota right after the call: %+v", got)
+	}
+
+	if rec := patchLimits(t, r, knownPub, `{"quota_bytes":100000}`); rec.Code != http.StatusOK {
+		t.Fatalf("raising = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := peerRow(t, r, knownPub); got.SuspendReason != "" {
+		t.Fatalf("raising the limit must put the peer back in service: %+v", got)
+	}
+}
+
+// Spec Q9/Q19: the reset zeroes the counters, stamps the moment and returns the
+// peer to service in the same call; the limit itself stays.
+func TestResetAWGPeerTrafficZeroesAndAdmits(t *testing.T) {
+	h, r := newAWGTestHandler(t)
+	seedQuotaPeer(t, h, awg.Peer{QuotaBytes: 1000, UsedRx: 900, UsedTx: 900})
+	before := time.Now().Unix()
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost,
+		"/api/awg/peers/"+knownPub+"/traffic/reset", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	// The answer is the Status envelope, like the PATCH.
+	if !strings.Contains(rec.Body.String(), `"peer_count"`) {
+		t.Fatalf("reset must answer with the AWG status: %s", rec.Body.String())
+	}
+	got := peerRow(t, r, knownPub)
+	if got.Rx != 0 || got.Tx != 0 {
+		t.Fatalf("counters not zeroed: %+v", got)
+	}
+	if got.UsedResetAt < before {
+		t.Fatalf("used_reset_at not stamped: %+v", got)
+	}
+	if got.QuotaBytes != 1000 {
+		t.Fatalf("reset must keep the limit: %+v", got)
+	}
+	if got.SuspendReason != "" {
+		t.Fatalf("reset must return the peer to service: %+v", got)
+	}
+}
+
+func TestResetAWGPeerTrafficUnknownIs404(t *testing.T) {
+	_, r := newAWGTestHandler(t)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost,
+		"/api/awg/peers/"+validButUnknown+"/traffic/reset", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown peer reset = %d; want 404; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResetAWGPeerTrafficBadKeyIs400(t *testing.T) {
+	_, r := newAWGTestHandler(t)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost,
+		"/api/awg/peers/not-a-key/traffic/reset", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad key reset = %d; want 400; body=%q", rec.Code, rec.Body.String())
 	}
 }
