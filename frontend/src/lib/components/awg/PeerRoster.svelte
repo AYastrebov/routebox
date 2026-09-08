@@ -657,6 +657,12 @@
 	}
 	.peer-meta {
 		display: flex;
+		/* Wrap onto a second line instead of squeezing every item below its own
+		   text. The "Quota" button (#95) took ~60px off this column, and the
+		   default flex-shrink then folded "↓ 343.5 KB ↑ 11.7 MB" into a 31px
+		   stack and cut "no expiry" down to "no exp". Nothing here is optional
+		   enough to lose, so the line reflows and the row gets taller. */
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.625rem;
 		margin-top: 2px;
@@ -666,6 +672,11 @@
 		   which sits at the left edge of .peer-name, is never cut off (#34). */
 		min-width: 0;
 		overflow: hidden;
+	}
+	/* Never shrink a meta item below its text: wrapping is the answer to a narrow
+	   column, squeezing is not (see .peer-meta). */
+	.peer-meta > * {
+		flex: none;
 	}
 	.peer-meta .addr {
 		font-family: inherit;
