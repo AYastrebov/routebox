@@ -8,6 +8,7 @@ const REQUIRED_KEYS = [
 	'dashboard.download',
 	'dashboard.upload',
 	'dashboard.avg',
+	'dashboard.peak',
 	'dashboard.cores',
 	'dashboard.load',
 	'dashboard.ofTotal',

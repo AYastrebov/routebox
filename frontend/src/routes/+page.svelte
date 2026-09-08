@@ -7,6 +7,7 @@
 	import PendingChanges from '$lib/components/shared/PendingChanges.svelte';
 	import LiveStrip from '$lib/components/shared/LiveStrip.svelte';
 	import { splitUnit } from '$lib/utils/sparkline';
+	import { liveHistory } from '$lib/stores/liveHistory';
 	import type { ProcessStatus, ClashConnection, SystemInfo } from '$lib/types';
 
 	// Svelte 5 reactive state
@@ -26,15 +27,17 @@
 	// from the stream (60 points); host metrics are polled every 2 s (30 points).
 	const TRAFFIC_POINTS = 60;
 	const SYSTEM_POINTS = 30;
-	let downHist = $state<number[]>([]);
-	let upHist = $state<number[]>([]);
-	let cpuHist = $state<number[]>([]);
-	let memHist = $state<number[]>([]);
+	let downHist = $state<number[]>(liveHistory.down);
+	let upHist = $state<number[]>(liveHistory.up);
+	let cpuHist = $state<number[]>(liveHistory.cpu);
+	let memHist = $state<number[]>(liveHistory.mem);
 	let system = $state<SystemInfo | null>(null);
 	// One scale for both traffic strips, so a 6 KB/s upload does not look as
 	// tall as a 60 KB/s download next to it.
 	let trafficMax = $derived(Math.max(1024, ...downHist, ...upHist) * 1.15);
 	const avg = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+	const peak = (xs: number[]) => (xs.length ? Math.max(...xs) : 0);
+	const trafficNote = (xs: number[]) => `${$t('dashboard.avg')} ${formatSpeed(avg(xs))} · ${$t('dashboard.peak')} ${formatSpeed(peak(xs))}`;
 	let rate = $derived({ down: splitUnit(formatSpeed(trafficDown)), up: splitUnit(formatSpeed(trafficUp)) });
 	let memPct = $derived(system && system.mem_total ? Math.round((system.mem_used / system.mem_total) * 100) : null);
 	let cpuPct = $derived(system?.cpu_percent == null ? null : Math.round(system.cpu_percent));
@@ -43,8 +46,8 @@
 		try {
 			const s = await api.getSystem();
 			system = s;
-			if (s.cpu_percent != null) cpuHist = [...cpuHist.slice(-(SYSTEM_POINTS - 1)), s.cpu_percent];
-			if (s.mem_total) memHist = [...memHist.slice(-(SYSTEM_POINTS - 1)), (s.mem_used / s.mem_total) * 100];
+			if (s.cpu_percent != null) cpuHist = liveHistory.cpu = [...cpuHist.slice(-(SYSTEM_POINTS - 1)), s.cpu_percent];
+			if (s.mem_total) memHist = liveHistory.mem = [...memHist.slice(-(SYSTEM_POINTS - 1)), (s.mem_used / s.mem_total) * 100];
 		} catch {
 			// Host metrics are a nicety: keep the last reading, say nothing.
 		}
@@ -161,8 +164,8 @@
 		trafficStream = createTrafficStream((data) => {
 			trafficUp = data.up;
 			trafficDown = data.down;
-			downHist = [...downHist.slice(-(TRAFFIC_POINTS - 1)), data.down];
-			upHist = [...upHist.slice(-(TRAFFIC_POINTS - 1)), data.up];
+			downHist = liveHistory.down = [...downHist.slice(-(TRAFFIC_POINTS - 1)), data.down];
+			upHist = liveHistory.up = [...upHist.slice(-(TRAFFIC_POINTS - 1)), data.up];
 		});
 	}
 
@@ -172,8 +175,7 @@
 			trafficStream = null;
 			trafficUp = 0;
 			trafficDown = 0;
-			downHist = [];
-			upHist = [];
+			// History stays: this also runs on leaving the page (#99).
 		}
 	}
 
@@ -428,10 +430,10 @@
 			<div class="bg-[var(--ctp-surface1)] rounded-lg py-4 sm:py-5 mb-6">
 				<div class="grid grid-cols-2 sm:grid-cols-4 gap-y-5">
 					<div class="px-4 sm:px-5">
-						<LiveStrip label="↓ {$t('dashboard.download')}" value={rate.down.value} unit={rate.down.unit} sub="{$t('dashboard.avg')} {formatSpeed(avg(downHist))}" values={downHist} max={trafficMax} />
+						<LiveStrip label="↓ {$t('dashboard.download')}" value={rate.down.value} unit={rate.down.unit} sub={trafficNote(downHist)} values={downHist} max={trafficMax} />
 					</div>
 					<div class="px-4 sm:px-5 border-l border-[var(--ctp-surface2)]">
-						<LiveStrip label="↑ {$t('dashboard.upload')}" value={rate.up.value} unit={rate.up.unit} sub="{$t('dashboard.avg')} {formatSpeed(avg(upHist))}" values={upHist} max={trafficMax} color="var(--ctp-upload)" />
+						<LiveStrip label="↑ {$t('dashboard.upload')}" value={rate.up.value} unit={rate.up.unit} sub={trafficNote(upHist)} values={upHist} max={trafficMax} color="var(--ctp-upload)" />
 					</div>
 					<div class="px-4 sm:px-5 sm:border-l border-[var(--ctp-surface2)]">
 						<LiveStrip label="CPU" value={cpuPct == null ? '—' : String(cpuPct)} unit={cpuPct == null ? '' : '%'} sub={system ? `${system.cores} ${$t('dashboard.cores')} · ${$t('dashboard.load')} ${system.load1.toFixed(2)}` : ''} values={cpuHist} max={100} />
