@@ -112,3 +112,41 @@ export function gbFieldValue(bytes: number): number | null {
 	// the exact quotient is still the safe answer, only an ugly one.
 	return exact;
 }
+
+/** What is wrong with what the operator typed, or null when nothing is. */
+export type QuotaInputProblem = 'invalid' | 'negative' | null;
+
+/**
+ * The guard every quota field runs BEFORE it may PATCH, because 0 on the wire
+ * means REMOVE THE LIMIT.
+ *
+ * `badInput` is the element's `validity.badInput`: the binding alone cannot tell
+ * the two ways of being empty apart — text the browser could not parse ("1,5" on
+ * an English page in Firefox) binds as null, exactly like a cleared field. A
+ * negative is the other way of accidentally meaning "unlimited", since gbToBytes
+ * folds it to 0. An empty field and a typed 0 are real choices and pass.
+ *
+ * PURE: the caller turns the answer into its own toast.
+ */
+export function quotaInputProblem(badInput: boolean, gb: number | null): QuotaInputProblem {
+	if (badInput) return 'invalid';
+	if (gb !== null && gb < 0) return 'negative';
+	return null;
+}
+
+/** Either "send these bytes" or "there is nothing to send". */
+export type QuotaSavePlan = { skip: true } | { skip: false; bytes: number };
+
+/**
+ * What Save should do with the field's value against the stored limit.
+ *
+ * The comparison is in BYTES: the field is prefilled with the stored limit
+ * divided by 1024^3, so comparing in GB would call an untouched field a change
+ * and write the round-trip back over the stored value. Skipping means no request
+ * at all — the operator who only came to look changes nothing.
+ */
+export function quotaSavePlan(gb: number | null, storedBytes: number): QuotaSavePlan {
+	const bytes = gbToBytes(gb ?? 0);
+	if (bytes === (storedBytes || 0)) return { skip: true };
+	return { skip: false, bytes };
+}

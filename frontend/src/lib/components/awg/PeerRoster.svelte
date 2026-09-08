@@ -7,7 +7,13 @@
 	import type { AwgPeer } from '$lib/types';
 	import { formatBytes } from '$lib/stores/settings';
 	import { expiryStatus, unixToDateInput, dateInputToUnix, presetExpiry } from './peerExpiry';
-	import { gbToBytes, gbFieldValue, quotaUsage, suspendLabelKey } from './peerQuota';
+	import {
+		gbFieldValue,
+		quotaInputProblem,
+		quotaSavePlan,
+		quotaUsage,
+		suspendLabelKey
+	} from './peerQuota';
 	import { copyText } from '$lib/utils/clipboard';
 
 	interface Props {
@@ -105,35 +111,25 @@
 		}
 	}
 
-	// Every way of NOT having a number is refused before the PATCH, because 0 on
-	// the wire means "remove the limit": unparseable text and a negative would
-	// both hand the client unlimited traffic under a success toast.
+	// The refusal itself is pure (quotaInputProblem); this only picks the toast.
 	function quotaInputRejected(el: HTMLInputElement | null, gb: number | null): boolean {
-		if (el?.validity.badInput) {
-			notifications.error($t('awg.quotaInvalid'));
-			return true;
-		}
-		if (gb !== null && gb < 0) {
-			notifications.error($t('awg.quotaNegative'));
-			return true;
-		}
-		return false;
+		const problem = quotaInputProblem(el?.validity.badInput ?? false, gb);
+		if (problem === 'invalid') notifications.error($t('awg.quotaInvalid'));
+		if (problem === 'negative') notifications.error($t('awg.quotaNegative'));
+		return problem !== null;
 	}
 
 	async function saveQuota(p: AwgPeer) {
 		if (quotaInputRejected(quotaEl, quotaGb)) return;
-		const bytes = gbToBytes(quotaGb ?? 0);
-		// Compare in bytes, not in GB: the field shows the stored limit divided by
-		// 1024^3, and the operator who only came to look must not have their quota
-		// rewritten by the round-trip.
-		if (bytes === p.quota_bytes) {
+		const plan = quotaSavePlan(quotaGb, p.quota_bytes);
+		if (plan.skip) {
 			notifications.info($t('awg.quotaUnchanged'));
 			quotaFor = null;
 			return;
 		}
 		savingQuota = true;
 		try {
-			await api.setAwgPeerLimits(p.public_key, { quota_bytes: bytes });
+			await api.setAwgPeerLimits(p.public_key, { quota_bytes: plan.bytes });
 			notifications.success($t('awg.quotaSaved'));
 			quotaFor = null;
 			await onChange();
@@ -229,10 +225,10 @@
 			// is a second call. It is reported separately on failure: the peer
 			// exists either way, and "add failed" would send the operator looking
 			// for a client that is already on the interface — without a limit.
-			const quota = gbToBytes(newQuotaGb ?? 0);
-			if (quota > 0) {
+			const plan = quotaSavePlan(newQuotaGb, 0);
+			if (!plan.skip) {
 				try {
-					await api.setAwgPeerLimits(created.public_key, { quota_bytes: quota });
+					await api.setAwgPeerLimits(created.public_key, { quota_bytes: plan.bytes });
 				} catch (e) {
 					notifications.error(`${$t('awg.quotaFailed')}: ${e}`);
 				}

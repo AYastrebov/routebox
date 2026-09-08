@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { GB, gbToBytes, bytesToGb, gbFieldValue, quotaUsage, suspendLabelKey } from './peerQuota';
+import {
+	GB,
+	gbToBytes,
+	bytesToGb,
+	gbFieldValue,
+	quotaInputProblem,
+	quotaSavePlan,
+	quotaUsage,
+	suspendLabelKey
+} from './peerQuota';
 
 describe('gbToBytes', () => {
 	it('uses 1024^3, not 1000^3', () => expect(gbToBytes(1)).toBe(1_073_741_824));
@@ -94,5 +103,46 @@ describe('gbFieldValue', () => {
 		expect(gbFieldValue(0)).toBe(null);
 		expect(gbFieldValue(-1)).toBe(null);
 		expect(gbFieldValue(NaN)).toBe(null);
+	});
+});
+
+// The two guards every quota field needs before it may PATCH. They were written
+// twice (peer roster, users page) and pinned nowhere; here they are pinned once,
+// and the pages only decide which toast to show.
+describe('quotaInputProblem', () => {
+	it('passes a real number through', () => expect(quotaInputProblem(false, 2.5)).toBe(null));
+	it('passes an empty field through — that is "no limit", a real choice', () =>
+		expect(quotaInputProblem(false, null)).toBe(null));
+	it('passes a typed zero through — also "no limit"', () =>
+		expect(quotaInputProblem(false, 0)).toBe(null));
+	// The browser could not parse what is in the field ("1,5" on an English page
+	// in Firefox): the binding says null, exactly like a cleared field, and a
+	// cleared field means "remove the limit".
+	it('catches unreadable input, which binds as null', () =>
+		expect(quotaInputProblem(true, null)).toBe('invalid'));
+	it('reports unreadable input before anything else', () =>
+		expect(quotaInputProblem(true, -3)).toBe('invalid'));
+	it('catches a negative, which would otherwise convert to "no limit"', () =>
+		expect(quotaInputProblem(false, -0.5)).toBe('negative'));
+});
+
+describe('quotaSavePlan', () => {
+	it('converts GB to whole bytes', () =>
+		expect(quotaSavePlan(2, 0)).toEqual({ skip: false, bytes: 2 * GB }));
+	it('reads an empty field as removing the limit', () =>
+		expect(quotaSavePlan(null, 5 * GB)).toEqual({ skip: false, bytes: 0 }));
+	// Compared in BYTES, not in GB: the field shows the stored limit divided by
+	// 1024^3, and an operator who only came to look must not have it rewritten.
+	it('skips the request when the value did not change', () =>
+		expect(quotaSavePlan(1.3, gbToBytes(1.3))).toEqual({ skip: true }));
+	it('skips an empty field on a peer that has no limit', () =>
+		expect(quotaSavePlan(null, 0)).toEqual({ skip: true }));
+	it('does not skip a real change', () =>
+		expect(quotaSavePlan(1.3, gbToBytes(1.2))).toEqual({ skip: false, bytes: gbToBytes(1.3) }));
+	// What the prefill exists for: filling from the store and saving untouched is
+	// not a write at all.
+	it('skips a value that came from gbFieldValue untouched', () => {
+		const stored = 1_395_864_371;
+		expect(quotaSavePlan(gbFieldValue(stored), stored)).toEqual({ skip: true });
 	});
 });

@@ -6,11 +6,12 @@
 	import Modal from '$lib/components/shared/Modal.svelte';
 	import ShareModal from '$lib/components/config/users/ShareModal.svelte';
 	import Sparkline from '$lib/components/shared/Sparkline.svelte';
-	import { gbToBytes, gbFieldValue } from '$lib/components/awg/peerQuota';
+	import { gbFieldValue, quotaInputProblem, quotaSavePlan } from '$lib/components/awg/peerQuota';
 	import {
 		userQuotaUsage,
 		userSuspendLabelKey,
-		mergeQuotaFields
+		mergeQuotaFields,
+		quotaDraftValue
 	} from '$lib/components/config/users/userQuota';
 	import type { PanelUser, Inbound, UserTrafficResponse } from '$lib/types';
 
@@ -43,6 +44,10 @@
 	// page in Firefox) binds as null exactly like a cleared field — and a cleared
 	// field means "remove the limit". validity.badInput is the difference.
 	let quotaGb = $state<Record<string, number | null>>({});
+	// What the LAST prefill put in each field. A field that still shows it is
+	// untouched and may be refilled from the store; anything else is the
+	// operator's unsaved draft and survives the reload (quotaDraftValue).
+	let prefilledGb: Record<string, number | null> = {};
 	let quotaEls = $state<Record<string, HTMLInputElement | null>>({});
 	let savingQuota = $state<string | null>(null);
 	// Zeroing the counters is destructive and lives in the row, so it confirms in
@@ -128,14 +133,22 @@
 		}
 	}
 
-	// The number the field shows is the stored limit, exactly: an untouched Save
-	// then sends back the same byte count instead of a rounded one.
+	// The number a field shows is the stored limit, exactly: an untouched Save
+	// then sends back the same byte count instead of a rounded one. Runs on every
+	// list fetch, and a list fetch happens for reasons that have nothing to do
+	// with the quota (a toggle, an expiry, the apply bar) — so a field the
+	// operator has typed into keeps what they typed.
 	function prefillQuotas() {
 		const next: Record<string, number | null> = {};
+		const stamps: Record<string, number | null> = {};
 		for (const u of users) {
-			if (u.id) next[u.id] = gbFieldValue(u.quota_bytes ?? 0);
+			if (!u.id) continue;
+			const stored = gbFieldValue(u.quota_bytes ?? 0);
+			next[u.id] = quotaDraftValue(stored, quotaGb[u.id], prefilledGb[u.id]);
+			stamps[u.id] = stored;
 		}
 		quotaGb = next;
+		prefilledGb = stamps;
 		resetArmed = null;
 	}
 
@@ -191,19 +204,12 @@
 		}
 	}
 
-	// Every way of NOT having a number is refused before the PATCH, because 0 on
-	// the wire means "remove the limit": unparseable text and a negative would
-	// both hand a user unlimited traffic under a success toast.
+	// The refusal itself is pure (quotaInputProblem); this only picks the toast.
 	function quotaInputRejected(el: HTMLInputElement | null, gb: number | null): boolean {
-		if (el?.validity.badInput) {
-			notifications.error($t('awg.quotaInvalid'));
-			return true;
-		}
-		if (gb !== null && gb < 0) {
-			notifications.error($t('awg.quotaNegative'));
-			return true;
-		}
-		return false;
+		const problem = quotaInputProblem(el?.validity.badInput ?? false, gb);
+		if (problem === 'invalid') notifications.error($t('awg.quotaInvalid'));
+		if (problem === 'negative') notifications.error($t('awg.quotaNegative'));
+		return problem !== null;
 	}
 
 	// PATCH and reset answer from the registry alone, where the SQLite history
@@ -211,7 +217,11 @@
 	// traffic column the operator can see keeps the numbers the list fetched.
 	function applyQuotaAnswer(id: string, updated: PanelUser) {
 		users = users.map((x) => (x.id === id ? mergeQuotaFields(x, updated) : x));
-		quotaGb[id] = gbFieldValue(updated.quota_bytes ?? 0);
+		// Saved, so the field is no longer a draft: stamp it as prefilled too, or
+		// the next list fetch would mistake the saved value for unsaved typing.
+		const shown = gbFieldValue(updated.quota_bytes ?? 0);
+		quotaGb[id] = shown;
+		prefilledGb[id] = shown;
 	}
 
 	// Saves ONLY the quota: expiry is edited by its own control in the same row,
@@ -219,16 +229,14 @@
 	async function saveQuota(u: PanelUser) {
 		const gb = quotaGb[u.id] ?? null;
 		if (quotaInputRejected(quotaEls[u.id], gb)) return;
-		const bytes = gbToBytes(gb ?? 0);
-		// Compare in bytes: the field shows the stored limit divided by 1024^3, and
-		// an operator who only came to look must not have it rewritten by the trip.
-		if (bytes === (u.quota_bytes ?? 0)) {
+		const plan = quotaSavePlan(gb, u.quota_bytes ?? 0);
+		if (plan.skip) {
 			notifications.info($t('awg.quotaUnchanged'));
 			return;
 		}
 		savingQuota = u.id;
 		try {
-			const updated = await api.updateUser(u.id, { quota_bytes: bytes });
+			const updated = await api.updateUser(u.id, { quota_bytes: plan.bytes });
 			notifications.success($t('awg.quotaSaved'));
 			applyQuotaAnswer(u.id, updated);
 			warnIfNotEverywhere(updated);
@@ -375,7 +383,7 @@
 								<!-- The quota's own counters (rx + tx since the last reset), a
 								     different number from the traffic history above it. -->
 								{#if usage.quota > 0}
-									<div class="quota-line">
+									<div class="quota-line" title={$t('awg.transferCumulative')}>
 										<div class="quota-track">
 											<div class="quota-fill" class:over={usage.exhausted} style="width: {usage.pct}%"></div>
 										</div>
@@ -427,12 +435,14 @@
 										onclick={() => saveQuota(u)}>{$t('awg.saveQuota')}</button>
 									<!-- Destructive, so it confirms where it stands: first click arms,
 									     second click zeroes the counters (spec Q9). -->
-									{#if resetArmed === u.id}
-										<button type="button" class="expiry-clear reset-confirm" disabled={resetting}
-											onclick={() => resetTraffic(u)}>{$t('awg.resetCounterConfirm')}</button>
-									{:else}
-										<button type="button" class="expiry-clear"
-											onclick={() => (resetArmed = u.id)}>{$t('awg.resetCounter')}</button>
+									{#if u.quota_bytes > 0}
+										{#if resetArmed === u.id}
+											<button type="button" class="expiry-clear reset-confirm" disabled={resetting}
+												onclick={() => resetTraffic(u)}>{$t('awg.resetCounterConfirm')}</button>
+										{:else}
+											<button type="button" class="expiry-clear"
+												onclick={() => (resetArmed = u.id)}>{$t('awg.resetCounter')}</button>
+										{/if}
 									{/if}
 								</div>
 							{/if}
@@ -631,12 +641,19 @@
 		white-space: nowrap;
 	}
 
+	/* Label + input + two buttons is 350-410px, wider than the card on a 390px
+	   phone: it wraps inside the card instead of pushing past its edge, and the
+	   input gives up width first. */
 	.quota-cell {
 		display: inline-flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.4rem;
+		max-width: 100%;
 	}
 	.quota-input {
+		flex: 0 1 6rem;
+		min-width: 4rem;
 		width: 6rem;
 		background: var(--ctp-mantle);
 		border: 1px solid var(--ctp-surface2);

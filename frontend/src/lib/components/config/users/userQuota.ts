@@ -76,3 +76,24 @@ export function mergeQuotaFields(row: PanelUser, updated: Partial<UserQuotaField
 		suspend_reason: updated.suspend_reason ?? row.suspend_reason
 	};
 }
+
+/**
+ * What a row's quota field should show after the list was re-fetched.
+ *
+ * Every reload re-runs the prefill — a toggle, an expiry change, an added
+ * binding and the apply/discard bar all call load() — and a prefill that simply
+ * overwrote the field would throw away a limit the operator was in the middle of
+ * typing. So the stored value only wins while the field still shows what the
+ * PREVIOUS prefill put there (`prefilled`): the moment the two differ, the
+ * difference is the operator's and it stays.
+ *
+ * `current`/`prefilled` are undefined for a row seen for the first time.
+ */
+export function quotaDraftValue(
+	stored: number | null,
+	current: number | null | undefined,
+	prefilled: number | null | undefined
+): number | null {
+	if (current === undefined || current === prefilled) return stored;
+	return current;
+}
