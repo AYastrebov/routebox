@@ -1248,3 +1248,267 @@ func TestUpdateUser_BadJSON400(t *testing.T) {
 		t.Fatalf("status %d, want 400", w.Code)
 	}
 }
+
+// --- quota (#95) ---
+
+// newUsersQuotaRouter mirrors main.go's /api/users subtree for the routes the
+// quota work touches, so a test exercises the SAME paths and methods production
+// registers (a one-route router would leave the path shape unpinned).
+func newUsersQuotaRouter(h *Handler) chi.Router {
+	r := chi.NewRouter()
+	r.Route("/api/users", func(r chi.Router) {
+		r.Get("/", h.ListUsers)
+		r.Patch("/{id}", h.UpdateUser)
+		r.Post("/{id}/traffic/reset", h.ResetUserTraffic)
+	})
+	return r
+}
+
+// spendUsage credits the named inbound user with download bytes through the same
+// entry point the StatsService sampler uses, so the test never writes Used*
+// directly (Put would drop it anyway — the counters belong to AddUsage).
+func spendUsage(t *testing.T, um *users.Manager, name string, down int64) {
+	t.Helper()
+	if _, err := um.AddUsage(map[string]struct{ Up, Down int64 }{name: {Down: down}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// userViewOf decodes one user view out of a handler response body.
+func userViewOf(t *testing.T, body []byte) userView {
+	t.Helper()
+	var resp struct {
+		Data userView `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	return resp.Data
+}
+
+func TestUpdateUser_QuotaNegative400(t *testing.T) {
+	h, _, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	id := um.List()[0].ID
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"quota_bytes":-1}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if u, _ := um.Get(id); u.QuotaBytes != 0 {
+		t.Fatalf("rejected quota must not be stored, got %d", u.QuotaBytes)
+	}
+}
+
+// TestUpdateUser_QuotaBelowUsedSuspendsThenRaisingReadmits pins Q19/Q20: saving a
+// limit under what is already spent suspends at once (reject rule written), and
+// raising it above re-admits at once — both through the PATCH handler, no draft.
+func TestUpdateUser_QuotaBelowUsedSuspendsThenRaisingReadmits(t *testing.T) {
+	h, cfg, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	id := um.List()[0].ID
+	spendUsage(t, um, "alice", 600)
+
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"quota_bytes":500}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	view := userViewOf(t, w.Body.Bytes())
+	if view.QuotaBytes != 500 || view.UsedRx != 600 {
+		t.Fatalf("response must carry quota/used, got quota=%d used_rx=%d", view.QuotaBytes, view.UsedRx)
+	}
+	if view.SuspendReason != "quota" {
+		t.Fatalf("suspend_reason = %q, want \"quota\"", view.SuspendReason)
+	}
+	if au := rejectRuleNames(cfg.GetActive()); len(au) != 1 || au[0] != "alice" {
+		t.Fatalf("lowering below used must suspend immediately, reject auth_user=%#v", au)
+	}
+	if cfg.HasDraft() {
+		t.Fatal("quota save must not create a config draft")
+	}
+
+	// Raise above what is spent: back in service, rule gone.
+	req = httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"quota_bytes":100000}`))
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("raise status %d: %s", w.Code, w.Body.String())
+	}
+	if view := userViewOf(t, w.Body.Bytes()); view.SuspendReason != "" {
+		t.Fatalf("raised limit must clear suspend_reason, got %q", view.SuspendReason)
+	}
+	if au := rejectRuleNames(cfg.GetActive()); au != nil {
+		t.Fatalf("raising above used must re-admit, reject auth_user=%#v", au)
+	}
+}
+
+func TestUpdateUser_QuotaOmittedUnchanged(t *testing.T) {
+	h, _, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	id := um.List()[0].ID
+	r := newUsersQuotaRouter(h)
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"quota_bytes":4096}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	// A later PATCH that omits quota_bytes must leave it alone (and 0 must clear it).
+	req = httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"expires_at":42}`))
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if u, _ := um.Get(id); u.QuotaBytes != 4096 || u.ExpiresAt != 42 {
+		t.Fatalf("omitted quota must persist: quota=%d expires=%d", u.QuotaBytes, u.ExpiresAt)
+	}
+	req = httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"quota_bytes":0}`))
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if u, _ := um.Get(id); u.QuotaBytes != 0 {
+		t.Fatalf("explicit 0 must clear the limit, got %d", u.QuotaBytes)
+	}
+}
+
+// TestUpdateUser_QuotaSaveKeepsCounters guards the Put-preserves-Used* contract
+// from the API side: a sampler tick landing before the save must not be erased by
+// the handler's Get→mutate→Put.
+func TestUpdateUser_QuotaSaveKeepsCounters(t *testing.T) {
+	h, _, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	id := um.List()[0].ID
+	spendUsage(t, um, "alice", 700)
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPatch, "/api/users/"+id, strings.NewReader(`{"quota_bytes":100000}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if u, _ := um.Get(id); u.UsedRx != 700 {
+		t.Fatalf("saving a quota must not touch used_rx, got %d", u.UsedRx)
+	}
+	if view := userViewOf(t, w.Body.Bytes()); view.UsedRx != 700 {
+		t.Fatalf("response used_rx = %d, want 700", view.UsedRx)
+	}
+}
+
+// TestResetUserTraffic_ZeroesAndReadmits pins Q9/Q19: the reset zeroes the
+// cumulative counters, stamps used_reset_at and puts a quota-suspended user back
+// in service right away.
+func TestResetUserTraffic_ZeroesAndReadmits(t *testing.T) {
+	h, cfg, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	u := um.List()[0]
+	id := u.ID
+	u.QuotaBytes = 500
+	if err := um.Put(&u); err != nil {
+		t.Fatal(err)
+	}
+	spendUsage(t, um, "alice", 600)
+	h.syncRejectRule()
+	if au := rejectRuleNames(cfg.GetActive()); len(au) != 1 {
+		t.Fatalf("precondition: alice must be quota-suspended, got %#v", au)
+	}
+
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPost, "/api/users/"+id+"/traffic/reset", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	view := userViewOf(t, w.Body.Bytes())
+	if view.UsedRx != 0 || view.UsedTx != 0 {
+		t.Fatalf("response must show zeroed counters, got rx=%d tx=%d", view.UsedRx, view.UsedTx)
+	}
+	if view.UsedResetAt == 0 {
+		t.Fatal("response must carry the used_reset_at stamp")
+	}
+	if view.QuotaBytes != 500 {
+		t.Fatalf("reset must keep the limit, got quota=%d", view.QuotaBytes)
+	}
+	if view.SuspendReason != "" {
+		t.Fatalf("reset must clear suspend_reason, got %q", view.SuspendReason)
+	}
+	stored, _ := um.Get(id)
+	if stored.UsedRx != 0 || stored.UsedTx != 0 || stored.UsedResetAt == 0 || stored.QuotaBytes != 500 {
+		t.Fatalf("registry after reset: %+v", stored)
+	}
+	if au := rejectRuleNames(cfg.GetActive()); au != nil {
+		t.Fatalf("reset must re-admit immediately, reject auth_user=%#v", au)
+	}
+	if cfg.HasDraft() {
+		t.Fatal("reset must not create a config draft")
+	}
+}
+
+func TestResetUserTraffic_NotFound404(t *testing.T) {
+	h, _, _ := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPost, "/api/users/nope/traffic/reset", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404", w.Code)
+	}
+}
+
+func TestResetUserTraffic_NoUsersMgr503(t *testing.T) {
+	h := &Handler{}
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodPost, "/api/users/x/traffic/reset", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503", w.Code)
+	}
+}
+
+// TestListUsers_IncludesQuotaFields keeps the list view from dropping the quota
+// fields the row has to draw (the view is a projection, not the raw PanelUser).
+func TestListUsers_IncludesQuotaFields(t *testing.T) {
+	h, _, um := newUsersTestHandler(t)
+	h.statusSource = func() process.Status { return process.Status{Running: false} }
+	u := um.List()[0]
+	u.QuotaBytes = 500
+	if err := um.Put(&u); err != nil {
+		t.Fatal(err)
+	}
+	spendUsage(t, um, "alice", 600)
+
+	r := newUsersQuotaRouter(h)
+	req := httptest.NewRequest(http.MethodGet, "/api/users/", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Data []userView `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 user, got %d", len(resp.Data))
+	}
+	got := resp.Data[0]
+	if got.QuotaBytes != 500 || got.UsedRx != 600 || got.UsedTx != 0 {
+		t.Fatalf("list must carry quota/used, got %+v", got)
+	}
+	if got.SuspendReason != "quota" {
+		t.Fatalf("list suspend_reason = %q, want \"quota\"", got.SuspendReason)
+	}
+	// The raw JSON keys are the contract the UI reads.
+	for _, key := range []string{`"quota_bytes"`, `"used_rx"`, `"used_tx"`, `"used_reset_at"`, `"suspend_reason"`} {
+		if !strings.Contains(w.Body.String(), key) {
+			t.Fatalf("list JSON missing %s: %s", key, w.Body.String())
+		}
+	}
+}

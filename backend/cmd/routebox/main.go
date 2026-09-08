@@ -824,6 +824,7 @@ func main() {
 				r.Post("/{id}/bindings", apiHandler.AddBinding)
 				r.Get("/{id}/link", apiHandler.GetUserLinkByID)
 				r.Get("/{id}/traffic", apiHandler.GetUserTraffic)
+				r.Post("/{id}/traffic/reset", apiHandler.ResetUserTraffic)
 				r.Post("/{id}/token/rotate", apiHandler.RotateUserToken)
 				r.Delete("/{id}/token", apiHandler.RevokeUserToken)
 			})

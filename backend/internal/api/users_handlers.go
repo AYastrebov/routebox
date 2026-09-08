@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -30,10 +31,34 @@ type userView struct {
 	Bindings      []users.Binding `json:"bindings"`
 	Upload        int64           `json:"upload"`
 	Download      int64           `json:"download"`
+	// QuotaBytes is the one-shot limit on UsedRx+UsedTx (0 = no limit) and
+	// Used*/UsedResetAt the cumulative counters behind it (#95). Upload/Download
+	// above are the SQLite history totals for the picked range — a different
+	// number with a different lifetime, so both travel.
+	QuotaBytes  int64 `json:"quota_bytes"`
+	UsedRx      int64 `json:"used_rx"`
+	UsedTx      int64 `json:"used_tx"`
+	UsedResetAt int64 `json:"used_reset_at"`
+	// SuspendReason is manual/quota/expired, or "" while the user is in service.
+	// DERIVED at response time from the stored numbers (never persisted), so the
+	// row cannot disagree with the reject rule the same numbers produce.
+	SuspendReason string `json:"suspend_reason"`
 	// Warning is set when the change was made but did not reach everywhere it
 	// had to — today, dest, which serves naive on its own. Omitted when empty,
 	// so every other answer keeps its shape.
 	Warning string `json:"warning,omitempty"`
+}
+
+// newUserView projects a registry user onto the wire shape, deriving
+// SuspendReason at now. The ONE place that projection lives: list, PATCH and the
+// counter reset all answer with the same fields.
+func newUserView(u users.PanelUser, now int64) userView {
+	return userView{
+		ID: u.ID, Name: u.Name, Enabled: u.Enabled, ExpiresAt: u.ExpiresAt,
+		Pending: false, Token: u.Token, TokenDisabled: u.TokenDisabled, Bindings: u.Bindings,
+		QuotaBytes: u.QuotaBytes, UsedRx: u.UsedRx, UsedTx: u.UsedTx, UsedResetAt: u.UsedResetAt,
+		SuspendReason: string(users.SuspendReason(u, now)),
+	}
 }
 
 // ListUsers returns registry (applied) users plus pending users that exist only
@@ -46,6 +71,7 @@ func (h *Handler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]userView, 0)
 	registered := map[string]bool{} // (tag\x00cred) covered by the registry
+	now := time.Now().Unix()
 
 	for _, u := range h.panelUsers.List() {
 		for _, b := range u.Bindings {
@@ -61,11 +87,9 @@ func (h *Handler) ListUsers(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		views = append(views, userView{
-			ID: u.ID, Name: u.Name, Enabled: u.Enabled, ExpiresAt: u.ExpiresAt,
-			Pending: false, Token: u.Token, TokenDisabled: u.TokenDisabled, Bindings: u.Bindings,
-			Upload: up, Download: down,
-		})
+		view := newUserView(u, now)
+		view.Upload, view.Download = up, down
+		views = append(views, view)
 	}
 
 	// Pending = server users present in the working (draft) config but whose
@@ -467,6 +491,10 @@ func (h *Handler) RevokeUserToken(w http.ResponseWriter, r *http.Request) {
 type updateUserBody struct {
 	Enabled   *bool  `json:"enabled"`
 	ExpiresAt *int64 `json:"expires_at"`
+	// QuotaBytes is the one-shot traffic limit; 0 clears it. Negative is
+	// rejected (400) rather than read as "no limit", so a UI bug cannot silently
+	// turn a limit off. Never resets the counters — that is the reset route.
+	QuotaBytes *int64 `json:"quota_bytes"`
 }
 
 // UpdateUser applies lifecycle changes (enabled / expires_at) to a registry user
@@ -494,19 +522,65 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	if body.ExpiresAt != nil {
 		u.ExpiresAt = *body.ExpiresAt
 	}
+	if body.QuotaBytes != nil {
+		if *body.QuotaBytes < 0 {
+			writeError(w, http.StatusBadRequest, "quota_bytes must be >= 0 (0 = no limit)")
+			return
+		}
+		u.QuotaBytes = *body.QuotaBytes
+	}
 	if err := h.panelUsers.Put(&u); err != nil {
 		// User existed (checked above): a non-nil error here is a save failure.
 		writeConfigError(w, http.StatusInternalServerError, err)
 		return
 	}
-	view := userView{
-		ID: u.ID, Name: u.Name, Enabled: u.Enabled, ExpiresAt: u.ExpiresAt,
-		Pending: false, Token: u.Token, TokenDisabled: u.TokenDisabled, Bindings: u.Bindings,
+	// Re-read: Put keeps the stored Used* counters (they belong to the sampler),
+	// so the answer must come from the registry, not from the copy this handler
+	// mutated — a tick that landed mid-request would otherwise be reported away.
+	if stored, ok := h.panelUsers.Get(id); ok {
+		u = stored
 	}
+	view := newUserView(u, time.Now().Unix())
 	// Immediate enforcement + reload-on-change. sing-box takes the change here;
 	// naive is dest's, and a lifecycle decision that did not reach dest leaves
 	// the user still connecting over naive — said out loud rather than logged,
 	// because the panel would otherwise report a clean success.
+	if err := h.syncRejectRule(); err != nil {
+		view.Warning = fmt.Sprintf("the change did not reach dest, so naive still uses the previous user list: %v", err)
+	}
+	writeSuccess(w, view)
+}
+
+// ResetUserTraffic zeroes the user's cumulative quota counters (used_rx/used_tx),
+// stamps used_reset_at and re-admits the user immediately when the quota was what
+// suspended them (spec Q9/Q19) — same derived enforcement as the enabled toggle,
+// no draft->apply. The limit itself is kept; raising it is the other way back in
+// service. Does NOT touch the SQLite traffic history (GET /users/{id}/traffic):
+// this counter is the quota's own, stored beside the user. PROTECTED.
+func (h *Handler) ResetUserTraffic(w http.ResponseWriter, r *http.Request) {
+	if h.panelUsers == nil {
+		writeError(w, http.StatusServiceUnavailable, "users not initialized")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if _, ok := h.panelUsers.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	now := time.Now().Unix()
+	if err := h.panelUsers.ResetUsage(id, now); err != nil {
+		// User exists (checked above): a non-nil error here is a save failure.
+		writeConfigError(w, http.StatusInternalServerError, err)
+		return
+	}
+	u, ok := h.panelUsers.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	view := newUserView(u, now)
+	// Same as UpdateUser: a decision that did not reach dest leaves naive on the
+	// old list, so it is said out loud instead of only logged.
 	if err := h.syncRejectRule(); err != nil {
 		view.Warning = fmt.Sprintf("the change did not reach dest, so naive still uses the previous user list: %v", err)
 	}
