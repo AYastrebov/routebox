@@ -224,9 +224,14 @@
     "ofTotal": "{used} из {total}",
     "totalDown": "Всего ↓",
     "totalUp": "Всего ↑",
-    "processRss": "RSS amnezia-box",
     "disk": "Диск /",
-    "lastMinute": "последние 60 с"
+    "lastMinute": "последние 60 с",
+    "period60s": "60 с",
+    "period1h": "1 ч",
+    "period24h": "24 ч",
+    "lastHour": "последний час",
+    "lastDay": "последние 24 ч",
+    "noHistory": "истории нет: адрес Clash API не задан"
   },
   "configMismatch": {
     "title": "Пути конфига разошлись",

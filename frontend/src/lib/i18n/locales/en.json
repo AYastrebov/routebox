@@ -224,9 +224,14 @@
     "ofTotal": "{used} of {total}",
     "totalDown": "Total ↓",
     "totalUp": "Total ↑",
-    "processRss": "amnezia-box RSS",
     "disk": "Disk /",
-    "lastMinute": "last 60 s"
+    "lastMinute": "last 60 s",
+    "period60s": "60 s",
+    "period1h": "1 h",
+    "period24h": "24 h",
+    "lastHour": "last hour",
+    "lastDay": "last 24 h",
+    "noHistory": "no history: Clash API address is not set"
   },
   "configMismatch": {
     "title": "Config path mismatch",

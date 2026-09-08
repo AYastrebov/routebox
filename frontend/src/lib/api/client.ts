@@ -564,11 +564,12 @@ export const api = {
 		requestRaw('/clash/connections', { method: 'DELETE' }),
 
 	// Traffic history (aggregated buckets for breakdowns)
-	getTrafficHistory: (range: TrafficRange, opts: { source?: string; domain?: string; chain?: string } = {}) => {
+	getTrafficHistory: (range: TrafficRange, opts: { source?: string; domain?: string; chain?: string; series?: boolean } = {}) => {
 		const qs = new URLSearchParams({ range });
 		if (opts.source) qs.set('source', opts.source);
 		if (opts.domain) qs.set('domain', opts.domain);
 		if (opts.chain) qs.set('chain', opts.chain);
+		if (opts.series) qs.set('series', '1');
 		return request<TrafficHistoryResponse>(`/traffic/history?${qs.toString()}`);
 	},
 	resetTrafficHistory: () =>

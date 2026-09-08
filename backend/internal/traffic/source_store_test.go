@@ -134,15 +134,15 @@ func TestHistoryStep(t *testing.T) {
 		{30 * day, 1800}, // month: 30 min
 	}
 	for _, tc := range cases {
-		got := historyStep(tc.window)
+		got := HistoryStep(tc.window)
 		if got != tc.want {
-			t.Errorf("historyStep(%d) = %d, want %d", tc.window, got, tc.want)
+			t.Errorf("HistoryStep(%d) = %d, want %d", tc.window, got, tc.want)
 		}
 		if got%60 != 0 {
-			t.Errorf("historyStep(%d) = %d is not a whole number of minutes", tc.window, got)
+			t.Errorf("HistoryStep(%d) = %d is not a whole number of minutes", tc.window, got)
 		}
 		if tc.window > 0 && tc.window/got > maxHistoryPoints {
-			t.Errorf("historyStep(%d) = %d yields %d points, over the %d cap",
+			t.Errorf("HistoryStep(%d) = %d yields %d points, over the %d cap",
 				tc.window, got, tc.window/got, maxHistoryPoints)
 		}
 	}
@@ -150,6 +150,28 @@ func TestHistoryStep(t *testing.T) {
 
 // A long range must not return one point per minute: the peers endpoint ships
 // every peer's series in a single response.
+func TestQuerySourceHistoryAllSources(t *testing.T) {
+	s := openTestStore(t)
+	for _, r := range []struct {
+		ts   int64
+		src  string
+		up   int64
+		down int64
+	}{{60, "10.0.0.2", 1, 2}, {60, "192.168.1.7", 10, 20}, {120, "192.168.1.7", 100, 200}} {
+		if err := s.Upsert(r.ts, r.src, "a.example", "direct", r.up, r.down); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hist, err := s.QuerySourceHistory(60, 120, "")
+	if err != nil {
+		t.Fatalf("QuerySourceHistory: %v", err)
+	}
+	want := []UserHistoryRow{{BucketTs: 60, Upload: 11, Download: 22}, {BucketTs: 120, Upload: 100, Download: 200}}
+	if len(hist) != 2 || hist[0] != want[0] || hist[1] != want[1] {
+		t.Fatalf("history = %+v, want %+v", hist, want)
+	}
+}
+
 func TestQuerySourceHistoryCoarsensLongRanges(t *testing.T) {
 	s, err := OpenStore(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {

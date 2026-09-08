@@ -6,8 +6,9 @@
 	import { singboxVersion, loadVersion } from '$lib/stores/version';
 	import PendingChanges from '$lib/components/shared/PendingChanges.svelte';
 	import LiveStrip from '$lib/components/shared/LiveStrip.svelte';
-	import { splitUnit } from '$lib/utils/sparkline';
-	import { liveHistory } from '$lib/stores/liveHistory';
+	import { splitUnit, areaPaths } from '$lib/utils/sparkline';
+	import { seriesRates } from '$lib/utils/trafficSeries';
+	import { liveHistory, type DashboardPeriod } from '$lib/stores/liveHistory';
 	import type { ProcessStatus, ClashConnection, SystemInfo } from '$lib/types';
 
 	// Svelte 5 reactive state
@@ -30,11 +31,50 @@
 	let downHist = $state<number[]>(liveHistory.down);
 	let upHist = $state<number[]>(liveHistory.up);
 	let cpuHist = $state<number[]>(liveHistory.cpu);
-	let memHist = $state<number[]>(liveHistory.mem);
 	let system = $state<SystemInfo | null>(null);
-	// One scale for both traffic strips, so a 6 KB/s upload does not look as
-	// tall as a 60 KB/s download next to it.
-	let trafficMax = $derived(Math.max(1024, ...downHist, ...upHist) * 1.15);
+
+	// The traffic graph shows either the live minute above or, for 1h/24h, the
+	// minute buckets of /traffic/history as B/s — the same SQLite history the
+	// Breakdown panel reads, so no second time series is kept (#99).
+	const PERIODS: DashboardPeriod[] = ['60s', '1h', '24h'];
+	let period = $state<DashboardPeriod>(liveHistory.period);
+	let histDown = $state<number[]>([]);
+	let histUp = $state<number[]>([]);
+	let histError = $state('');
+	async function loadHistory(p: '1h' | '24h') {
+		try {
+			const r = await api.getTrafficHistory(p, { series: true });
+			({ down: histDown, up: histUp } = seriesRates(r.series, r.start_ts, r.end_ts, r.step ?? 60, 240));
+			histError = '';
+		} catch (e) {
+			// 503 = no traffic store (Clash API address unset); anything else is
+			// still "no graph", and the message says which.
+			histError = String(e);
+			histDown = [];
+			histUp = [];
+		}
+	}
+	$effect(() => {
+		liveHistory.period = period;
+		if (period === '60s') return;
+		const p = period;
+		loadHistory(p);
+		// Buckets are minutes, so once a minute is as fresh as it gets.
+		const timer = setInterval(() => loadHistory(p), 60_000);
+		return () => clearInterval(timer);
+	});
+	let graphDown = $derived(period === '60s' ? downHist : histDown);
+	let graphUp = $derived(period === '60s' ? upHist : histUp);
+	// One scale for both series, so a 6 KB/s upload does not look as tall as a
+	// 60 KB/s download drawn over it.
+	let graphMax = $derived(Math.max(1024, ...graphDown, ...graphUp) * 1.15);
+	const GW = 600;
+	const GH = 88;
+	let downPaths = $derived(areaPaths(graphDown, graphMax, GW, GH));
+	let upPaths = $derived(areaPaths(graphUp, graphMax, GW, GH));
+	let periodLabel = $derived(
+		period === '60s' ? $t('dashboard.lastMinute') : period === '1h' ? $t('dashboard.lastHour') : $t('dashboard.lastDay')
+	);
 	const avg = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
 	const peak = (xs: number[]) => (xs.length ? Math.max(...xs) : 0);
 	const trafficNote = (xs: number[]) => `${$t('dashboard.avg')} ${formatSpeed(avg(xs))} · ${$t('dashboard.peak')} ${formatSpeed(peak(xs))}`;
@@ -47,7 +87,6 @@
 			const s = await api.getSystem();
 			system = s;
 			if (s.cpu_percent != null) cpuHist = liveHistory.cpu = [...cpuHist.slice(-(SYSTEM_POINTS - 1)), s.cpu_percent];
-			if (s.mem_total) memHist = liveHistory.mem = [...memHist.slice(-(SYSTEM_POINTS - 1)), (s.mem_used / s.mem_total) * 100];
 		} catch {
 			// Host metrics are a nicety: keep the last reading, say nothing.
 		}
@@ -426,32 +465,69 @@
 				</div>
 			</div>
 
-			<!-- Live strips: traffic + host, last minute -->
-			<div class="bg-[var(--ctp-surface1)] rounded-lg py-4 sm:py-5 mb-6">
-				<div class="grid grid-cols-2 sm:grid-cols-4 gap-y-5">
-					<div class="px-4 sm:px-5">
-						<LiveStrip label="↓ {$t('dashboard.download')}" value={rate.down.value} unit={rate.down.unit} sub={trafficNote(downHist)} values={downHist} max={trafficMax} />
+			<!-- Traffic graph with the host beside it (#99): one graph for both
+			     directions with a period switch; CPU keeps a mini graph, memory is a
+			     number; totals and disk in the footer. -->
+			<div class="bg-[var(--ctp-surface1)] rounded-lg mb-6">
+				<div class="flex flex-col sm:flex-row">
+					<div class="flex-1 min-w-0 px-4 sm:px-5 pt-4 sm:pt-5">
+						<div class="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+							<div class="flex flex-wrap items-baseline gap-x-5 gap-y-1 min-w-0">
+								<div class="flex items-baseline gap-x-1.5 min-w-0">
+									<span class="text-xs uppercase tracking-wide text-[var(--ctp-overlay1)]">↓ {$t('dashboard.download')}</span>
+									<span class="text-[28px] leading-none font-semibold tabular-nums text-[var(--ctp-text)]">{rate.down.value}</span>
+									<span class="text-xs text-[var(--ctp-overlay1)]">{rate.down.unit}</span>
+								</div>
+								<div class="flex items-baseline gap-x-1.5 min-w-0">
+									<span class="text-xs uppercase tracking-wide text-[var(--ctp-overlay1)]">↑ {$t('dashboard.upload')}</span>
+									<span class="text-[28px] leading-none font-semibold tabular-nums text-[var(--ctp-text)]">{rate.up.value}</span>
+									<span class="text-xs text-[var(--ctp-overlay1)]">{rate.up.unit}</span>
+								</div>
+							</div>
+							<div class="flex gap-1" role="group" aria-label={periodLabel}>
+								{#each PERIODS as p (p)}
+									<button type="button" class="toggle-btn !py-1 !px-2.5 text-xs whitespace-nowrap {period === p ? 'selected' : ''}" onclick={() => (period = p)}>{$t(`dashboard.period${p}`)}</button>
+								{/each}
+							</div>
+						</div>
+						<svg viewBox="0 0 {GW} {GH}" preserveAspectRatio="none" class="block w-full h-24 sm:h-28 mt-3" aria-hidden="true">
+							{#if downPaths.line || upPaths.line}
+								<path d={downPaths.area} fill="var(--ctp-primary)" opacity="0.14" />
+								<path d={upPaths.area} fill="var(--ctp-upload)" opacity="0.14" />
+								<path d={downPaths.line} fill="none" stroke="var(--ctp-primary)" stroke-width="1.5" stroke-linejoin="round" vector-effect="non-scaling-stroke" />
+								<path d={upPaths.line} fill="none" stroke="var(--ctp-upload)" stroke-width="1.5" stroke-linejoin="round" vector-effect="non-scaling-stroke" />
+							{:else}
+								<line x1="0" y1={GH - 0.5} x2={GW} y2={GH - 0.5} stroke="var(--ctp-surface2)" stroke-width="1" vector-effect="non-scaling-stroke" />
+							{/if}
+						</svg>
+						<div class="flex flex-wrap gap-x-5 gap-y-1 mt-2 pb-4 sm:pb-5 text-xs text-[var(--ctp-overlay1)]">
+							<span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full inline-block" style="background: var(--ctp-primary)"></span>{$t('dashboard.download')} · {trafficNote(graphDown)}</span>
+							<span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full inline-block" style="background: var(--ctp-upload)"></span>{$t('dashboard.upload')} · {trafficNote(graphUp)}</span>
+							<span class="ml-auto text-[var(--ctp-overlay0)]" title={histError}>{period !== '60s' && histError ? $t('dashboard.noHistory') : periodLabel}</span>
+						</div>
 					</div>
-					<div class="px-4 sm:px-5 border-l border-[var(--ctp-surface2)]">
-						<LiveStrip label="↑ {$t('dashboard.upload')}" value={rate.up.value} unit={rate.up.unit} sub={trafficNote(upHist)} values={upHist} max={trafficMax} color="var(--ctp-upload)" />
-					</div>
-					<div class="px-4 sm:px-5 sm:border-l border-[var(--ctp-surface2)]">
-						<LiveStrip label="CPU" value={cpuPct == null ? '—' : String(cpuPct)} unit={cpuPct == null ? '' : '%'} sub={system ? `${system.cores} ${$t('dashboard.cores')} · ${$t('dashboard.load')} ${system.load1.toFixed(2)}` : ''} values={cpuHist} max={100} />
-					</div>
-					<div class="px-4 sm:px-5 border-l border-[var(--ctp-surface2)]">
-						<LiveStrip label={$t('dashboard.memory')} value={memPct == null ? '—' : String(memPct)} unit={memPct == null ? '' : '%'} sub={system ? $t('dashboard.ofTotal', { values: { used: formatBytes(system.mem_used), total: formatBytes(system.mem_total) } }) : ''} values={memHist} max={100} />
+					<div class="sm:w-48 shrink-0 border-t sm:border-t-0 sm:border-l border-[var(--ctp-surface2)] px-4 sm:px-5 py-4 sm:py-5 flex flex-row sm:flex-col gap-5">
+						<div class="flex-1 min-w-0">
+							<LiveStrip label="CPU" value={cpuPct == null ? '—' : String(cpuPct)} unit={cpuPct == null ? '' : '%'} sub={system ? `${system.cores} ${$t('dashboard.cores')} · ${$t('dashboard.load')} ${system.load1.toFixed(2)}` : ''} values={cpuHist} max={100} />
+						</div>
+						<div class="flex-1 min-w-0 flex flex-col gap-2.5">
+							<div class="text-xs uppercase tracking-wide text-[var(--ctp-overlay1)] truncate">{$t('dashboard.memory')}</div>
+							<div class="flex items-baseline gap-x-2">
+								<span class="text-[28px] leading-none font-semibold text-[var(--ctp-text)] tabular-nums">{memPct == null ? '—' : memPct}</span>
+								<span class="text-xs text-[var(--ctp-overlay1)]">{memPct == null ? '' : '%'}</span>
+							</div>
+							{#if system?.mem_total}
+								<div class="text-xs text-[var(--ctp-overlay1)]">{$t('dashboard.ofTotal', { values: { used: formatBytes(system.mem_used), total: formatBytes(system.mem_total) } })}</div>
+							{/if}
+						</div>
 					</div>
 				</div>
-				<div class="flex flex-wrap gap-x-6 gap-y-1 px-4 sm:px-5 pt-3 mt-4 border-t border-[var(--ctp-surface2)] text-xs text-[var(--ctp-overlay1)]">
+				<div class="flex flex-wrap gap-x-6 gap-y-1 px-4 sm:px-5 py-3 border-t border-[var(--ctp-surface2)] text-xs text-[var(--ctp-overlay1)]">
 					<span>{$t('dashboard.totalDown')} <span class="text-[var(--ctp-text)] tabular-nums">{formatBytes(downloadTotal)}</span></span>
 					<span>{$t('dashboard.totalUp')} <span class="text-[var(--ctp-text)] tabular-nums">{formatBytes(uploadTotal)}</span></span>
-					{#if system?.process_rss}
-						<span>{$t('dashboard.processRss')} <span class="text-[var(--ctp-text)] tabular-nums">{formatBytes(system.process_rss)}</span></span>
-					{/if}
 					{#if system?.disk_total}
 						<span>{$t('dashboard.disk')} <span class="text-[var(--ctp-text)] tabular-nums">{$t('dashboard.ofTotal', { values: { used: formatBytes(system.disk_used), total: formatBytes(system.disk_total) } })}</span></span>
 					{/if}
-					<span class="ml-auto text-[var(--ctp-overlay0)]">{$t('dashboard.lastMinute')}</span>
 				</div>
 			</div>
 

@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"routebox/backend/internal/traffic"
 )
 
 type trafficResponse struct {
@@ -11,6 +13,11 @@ type trafficResponse struct {
 	StartTs int64           `json:"start_ts"`
 	EndTs   int64           `json:"end_ts"`
 	Buckets []trafficBucket `json:"buckets"`
+	// With ?series=1: the same window as a time series (bytes per bucket of
+	// `step` seconds, buckets with no traffic omitted), summed over the
+	// filters above — the dashboard graph for 1h/24h (#99).
+	Series []traffic.UserHistoryRow `json:"series,omitempty"`
+	Step   int64                    `json:"step,omitempty"`
 }
 
 type trafficBucket struct {
@@ -67,6 +74,18 @@ func (h *Handler) GetTrafficHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	for i, row := range rows {
 		out.Buckets[i] = trafficBucket(row)
+	}
+	if q.Get("series") == "1" {
+		// Only the source filter applies: the series is per (bucket, source)
+		// and domain/chain would need their own query shape. An idle window
+		// has no series key at all (omitempty) — callers default to [].
+		series, err := h.traffic.QuerySourceHistory(start, now, q.Get("source"))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out.Series = series
+		out.Step = traffic.HistoryStep(dur)
 	}
 	writeSuccess(w, out)
 }

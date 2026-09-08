@@ -869,11 +869,21 @@ export interface TrafficBucket {
 	download: number;
 }
 
+export interface TrafficSeriesPoint {
+	ts: number;       // first minute-bucket the point covers
+	upload: number;   // bytes over `step` seconds
+	download: number;
+}
+
 export interface TrafficHistoryResponse {
 	range: string;
 	start_ts: number;
 	end_ts: number;
 	buckets: TrafficBucket[];
+	// With series=1: whole-window time series (idle buckets omitted) and its
+	// bucket width in seconds. Absent entirely when the window has no traffic.
+	series?: TrafficSeriesPoint[];
+	step?: number;
 }
 
 export type TrafficRange = '1h' | '3h' | '24h' | 'week' | 'month';

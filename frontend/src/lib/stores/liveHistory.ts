@@ -3,9 +3,12 @@
 // ponytail: plain memory, filled only while the dashboard is open — a route
 // change leaves a gap that is not drawn. A server-side time series (needed for
 // the 24 h view anyway) replaces this.
+export type DashboardPeriod = '60s' | '1h' | '24h';
+
 export const liveHistory = {
 	down: [] as number[],
 	up: [] as number[],
 	cpu: [] as number[],
-	mem: [] as number[]
+	// The graph's chosen period survives navigation like the samples do.
+	period: '60s' as DashboardPeriod
 };

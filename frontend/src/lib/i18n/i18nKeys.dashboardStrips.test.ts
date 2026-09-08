@@ -14,9 +14,14 @@ const REQUIRED_KEYS = [
 	'dashboard.ofTotal',
 	'dashboard.totalDown',
 	'dashboard.totalUp',
-	'dashboard.processRss',
 	'dashboard.disk',
 	'dashboard.lastMinute',
+	'dashboard.lastHour',
+	'dashboard.lastDay',
+	'dashboard.period60s',
+	'dashboard.period1h',
+	'dashboard.period24h',
+	'dashboard.noHistory',
 	'dashboard.memory'
 ];
 

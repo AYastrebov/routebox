@@ -51,10 +51,10 @@ func (s *Store) LastSeenBySource(since int64) (map[string]int64, error) {
 // JSON) — and the peers endpoint returns EVERY peer in one response.
 const maxHistoryPoints = 1440
 
-// historyStep returns the bucket width, in seconds, for a window: minute
+// HistoryStep returns the bucket width, in seconds, for a window: minute
 // buckets until that would exceed maxHistoryPoints, then whole minutes coarse
 // enough to stay under it. PURE.
-func historyStep(window int64) int64 {
+func HistoryStep(window int64) int64 {
 	if window <= 0 {
 		return 60
 	}
@@ -65,19 +65,24 @@ func historyStep(window int64) int64 {
 	return step - step%60 // whole minutes: buckets are minute-aligned
 }
 
-// QuerySourceHistory returns the source's traffic as a time-ascending series.
-// Rows are collapsed across domain/chain — traffic_minute is keyed by
+// QuerySourceHistory returns the source's traffic as a time-ascending series;
+// an empty source means every source — the whole network, for the dashboard
+// graph (#99). Rows are collapsed across domain/chain — traffic_minute is keyed by
 // (bucket_ts, source, domain, chain), so a single minute of one peer's browsing
 // is many rows and the sparkline wants one point per bucket — and, for long
 // ranges, across several minutes as well (see historyStep). Each point is
 // stamped with the first bucket it covers.
 func (s *Store) QuerySourceHistory(startTs, endTs int64, source string) ([]UserHistoryRow, error) {
-	step := historyStep(endTs - startTs)
-	rows, err := s.db.Query(`
-		SELECT MIN(bucket_ts), SUM(upload), SUM(download) FROM traffic_minute
-		WHERE source = ? AND bucket_ts >= ? AND bucket_ts <= ?
-		GROUP BY bucket_ts / ? ORDER BY 1 ASC
-	`, source, startTs, endTs, step)
+	step := HistoryStep(endTs - startTs)
+	q := `SELECT MIN(bucket_ts), SUM(upload), SUM(download) FROM traffic_minute
+		WHERE bucket_ts >= ? AND bucket_ts <= ?`
+	args := []interface{}{startTs, endTs}
+	if source != "" {
+		q += " AND source = ?"
+		args = append(args, source)
+	}
+	q += " GROUP BY bucket_ts / ? ORDER BY 1 ASC"
+	rows, err := s.db.Query(q, append(args, step)...)
 	if err != nil {
 		return nil, err
 	}
