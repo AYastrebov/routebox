@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,11 +47,73 @@ func (awgNoopRunner) Run(_ context.Context, _ string, _ ...string) (string, stri
 	return "", "", nil
 }
 
+// awgRecRunner is awgNoopRunner that REMEMBERS the argv it was handed. The
+// interface calls (`awg set … peer <pub>` / `… remove`) are the only proof that a
+// handler actually went through the manager: a handler that wrote the store
+// directly would leave the roster looking exactly right and the peer still on the
+// interface. Same shape as the awg package's own fake runner, which is
+// test-internal to that package and cannot be reused from here.
+type awgRecRunner struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *awgRecRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, strings.TrimSpace(name+" "+strings.Join(args, " ")))
+	return "", "", nil
+}
+
+// forget drops the recorded calls, so an assertion can speak about ONE handler
+// call in a test that makes several.
+func (r *awgRecRunner) forget() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = nil
+}
+
+func (r *awgRecRunner) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+// sawSuspend / sawAdmit split the two directions of `awg set`: a suspend ends in
+// "remove", an admit is the same prefix WITHOUT it (it carries the psk file and
+// allowed-ips), so the admit check has to exclude the remove or every suspend
+// would read as one.
+func (r *awgRecRunner) sawSuspend(pub string) bool {
+	for _, c := range r.snapshot() {
+		if strings.Contains(c, "awg set awg-rb0 peer "+pub) && strings.Contains(c, " remove") {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *awgRecRunner) sawAdmit(pub string) bool {
+	for _, c := range r.snapshot() {
+		if strings.Contains(c, "awg set awg-rb0 peer "+pub) && !strings.Contains(c, " remove") {
+			return true
+		}
+	}
+	return false
+}
+
 // newAWGTestHandler wires a Handler with an awg.Manager (noop runner + a seeded
 // peer "knownPub" whose secret is known) and a real settings.Manager. Returns the
 // handler and a chi router mounting the /api/awg routes (no auth — the auth gate
 // is exercised separately by TestAWGRoutesRequireAuth).
 func newAWGTestHandler(t *testing.T) (*Handler, http.Handler) {
+	t.Helper()
+	h, r, _ := newAWGTestHandlerRec(t)
+	return h, r
+}
+
+// newAWGTestHandlerRec is the same harness with the recording runner handed back,
+// for the tests that must pin what reached the interface.
+func newAWGTestHandlerRec(t *testing.T) (*Handler, http.Handler, *awgRecRunner) {
 	t.Helper()
 	dir := t.TempDir()
 	awgDir := filepath.Join(dir, "amneziawg")
@@ -63,7 +126,8 @@ func newAWGTestHandler(t *testing.T) (*Handler, http.Handler) {
 		t.Fatal(err)
 	}
 
-	m := awg.NewManagerForTest(awgNoopRunner{}, awgDir, serverPriv, awg.Config{
+	rec := &awgRecRunner{}
+	m := awg.NewManagerForTest(rec, awgDir, serverPriv, awg.Config{
 		Iface:      "awg-rb0",
 		Subnet:     "10.10.0.0/24",
 		ServerIP:   "10.10.0.1",
@@ -102,7 +166,7 @@ func newAWGTestHandler(t *testing.T) (*Handler, http.Handler) {
 		r.Get("/backup", h.GetAWGBackup)
 		r.Post("/restore", h.RestoreAWGBackup)
 	})
-	return h, r
+	return h, r, rec
 }
 
 func newAWGSettings(t *testing.T, dir, publicHost string) *settings.Manager {
@@ -960,8 +1024,12 @@ func TestSetAWGPeerQuotaNegativeIs400(t *testing.T) {
 // Spec Q19/Q20: the verdict lands at save time. Lowering below what is spent
 // suspends immediately (reason "quota", not "expired"), raising re-admits.
 func TestSetAWGPeerQuotaSuspendsAndReadmitsImmediately(t *testing.T) {
-	h, r := newAWGTestHandler(t)
+	h, r, runner := newAWGTestHandlerRec(t)
 	seedQuotaPeer(t, h, awg.Peer{UsedRx: 600, UsedTx: 600})
+	// The seeded peer is in service (no quota, no expiry), so the lowering below
+	// is what takes it off — applySuspensionChange leaves an ALREADY-suspended
+	// peer alone, and the assertion would be vacuous.
+	runner.forget()
 
 	if rec := patchLimits(t, r, knownPub, `{"quota_bytes":1000}`); rec.Code != http.StatusOK {
 		t.Fatalf("lowering = %d; want 200; body=%q", rec.Code, rec.Body.String())
@@ -969,21 +1037,31 @@ func TestSetAWGPeerQuotaSuspendsAndReadmitsImmediately(t *testing.T) {
 	if got := peerRow(t, r, knownPub); got.SuspendReason != "quota" {
 		t.Fatalf("spent peer must be suspended on quota right after the call: %+v", got)
 	}
+	// …and it left the INTERFACE, not just the roster: a handler that wrote the
+	// store itself would satisfy every assertion above and leave the peer routing.
+	if !runner.sawSuspend(knownPub) {
+		t.Fatalf("expected an immediate `awg set … remove`; calls=%v", runner.snapshot())
+	}
 
+	runner.forget()
 	if rec := patchLimits(t, r, knownPub, `{"quota_bytes":100000}`); rec.Code != http.StatusOK {
 		t.Fatalf("raising = %d; want 200; body=%q", rec.Code, rec.Body.String())
 	}
 	if got := peerRow(t, r, knownPub); got.SuspendReason != "" {
 		t.Fatalf("raising the limit must put the peer back in service: %+v", got)
 	}
+	if !runner.sawAdmit(knownPub) {
+		t.Fatalf("expected an immediate re-admit on the interface; calls=%v", runner.snapshot())
+	}
 }
 
 // Spec Q9/Q19: the reset zeroes the counters, stamps the moment and returns the
 // peer to service in the same call; the limit itself stays.
 func TestResetAWGPeerTrafficZeroesAndAdmits(t *testing.T) {
-	h, r := newAWGTestHandler(t)
+	h, r, runner := newAWGTestHandlerRec(t)
 	seedQuotaPeer(t, h, awg.Peer{QuotaBytes: 1000, UsedRx: 900, UsedTx: 900})
 	before := time.Now().Unix()
+	runner.forget()
 
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost,
@@ -1007,6 +1085,39 @@ func TestResetAWGPeerTrafficZeroesAndAdmits(t *testing.T) {
 	}
 	if got.SuspendReason != "" {
 		t.Fatalf("reset must return the peer to service: %+v", got)
+	}
+	if !runner.sawAdmit(knownPub) {
+		t.Fatalf("the reset must put the peer back on the interface; calls=%v", runner.snapshot())
+	}
+}
+
+// A reset is not an amnesty: the counters are the quota's, and a peer whose DATE
+// has passed must stay off the interface with reason "expired" (spec Q18 — one
+// reason, and the operator still has to extend it).
+func TestResetAWGPeerTrafficOnExpiredPeerDoesNotReadmit(t *testing.T) {
+	h, r, runner := newAWGTestHandlerRec(t)
+	seedQuotaPeer(t, h, awg.Peer{
+		QuotaBytes: 1000, UsedRx: 900,
+		ExpiresAt: time.Now().Add(-48 * time.Hour).Unix(),
+	})
+	before := time.Now().Unix()
+	runner.forget()
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost,
+		"/api/awg/peers/"+knownPub+"/traffic/reset", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	got := peerRow(t, r, knownPub)
+	if got.Rx != 0 || got.Tx != 0 || got.UsedResetAt < before {
+		t.Fatalf("the counters must still be zeroed and stamped: %+v", got)
+	}
+	if got.SuspendReason != "expired" {
+		t.Fatalf("the expired date must still hold the peer: %+v", got)
+	}
+	if runner.sawAdmit(knownPub) {
+		t.Fatalf("an expired peer must NOT be re-admitted by a reset; calls=%v", runner.snapshot())
 	}
 }
 
