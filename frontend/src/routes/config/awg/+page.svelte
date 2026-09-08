@@ -413,17 +413,23 @@
 		</div>
 
 		{#if !isSingbox}
-			{#if status.kernel_module_version}
-				<div class="dep-note">
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="20 6 9 17 4 12" /></svg>
-					{$t('awg.depNoteVersion', { values: { version: status.kernel_module_version } })}
-				</div>
-			{:else}
-				<div class="dep-note">
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="20 6 9 17 4 12" /></svg>
+			<!-- The module state leads, the version only refines it. A version is
+			     readable in every state — including a failed DKMS rebuild with the
+			     old module still loaded — so branching on it first would announce
+			     "installed" over exactly the failure the state was reporting. -->
+			<div class="dep-note">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="20 6 9 17 4 12" /></svg>
+				{#if status.module !== 'ready'}
 					{$t('awg.depNote', { values: { module: moduleLabel(status.module) } })}
-				</div>
-			{/if}
+				{:else if status.kernel_module_version}
+					{$t('awg.depNoteVersion', { values: { version: status.kernel_module_version } })}
+				{:else}
+					<!-- Ready, but the version could not be read (restricted /sys in a
+					     container, no modinfo on PATH). Saying "not installed" here
+					     would be a flat contradiction of the running tunnel above. -->
+					{$t('awg.depNoteVersionUnknown')}
+				{/if}
+			</div>
 		{/if}
 
 		{@render backupCard(status.enabled)}
@@ -489,10 +495,13 @@
 									{/if}
 								</span>
 								<span>{$t('awg.kernelModule')}</span>
-								<!-- The version IS the readiness answer once we have one; the
-								     state label only has to speak for the cases where we do not. -->
+								<!-- Once ready, the version IS the readiness answer. In every
+								     other state the label has to stay: a red badge reading only
+								     "v1.0.20260725" is a colour with no word behind it. -->
 								<span class="status-badge {moduleReady ? 'success' : status.module === 'failed' ? 'error' : 'info'}">
-									{status.kernel_module_version ? `v${status.kernel_module_version}` : moduleLabel(status.module)}
+									{moduleReady && status.kernel_module_version
+										? `v${status.kernel_module_version}`
+										: moduleLabel(status.module)}
 								</span>
 							</div>
 						</div>

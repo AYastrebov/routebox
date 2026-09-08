@@ -2,8 +2,6 @@ package awg
 
 import (
 	"context"
-	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,31 +20,95 @@ func kernelAwg3EnableInput() EnableInput {
 }
 
 // Status must surface the installed module's version for the UI, and must
-// leave it empty when the module cannot be detected — never guess a version.
+// leave it empty when no version could be read — never guess one. Module, not
+// the version, is what says whether the module is installed at all.
 func TestStatusKernel_SurfacesModuleVersion(t *testing.T) {
-	origSysfs, origMod := sysfsModuleVersion, kernelModuleVersion
-	t.Cleanup(func() { sysfsModuleVersion, kernelModuleVersion = origSysfs, origMod })
-
-	t.Run("installed => version reported", func(t *testing.T) {
-		sysfsModuleVersion = func() (string, error) { return "3.0.20260731-04\n", nil }
+	t.Run("loaded => version reported, module ready", func(t *testing.T) {
 		f := newFakeRunner()
 		m := newEnableManager(t, f)
+		m.SetKernelModuleInfo(func() KernelModuleInfo {
+			return KernelModuleInfo{Version: "3.0.20260731-04", Detected: true, Loaded: true}
+		})
 		st := m.Status(context.Background())
 		if st.KernelModuleVersion != "3.0.20260731-04" {
 			t.Fatalf("KernelModuleVersion = %q, want %q", st.KernelModuleVersion, "3.0.20260731-04")
 		}
+		if st.Module != StateReady {
+			t.Fatalf("Module = %q, want %q — a version read out of sysfs proves the kernel runs it", st.Module, StateReady)
+		}
 	})
 
-	t.Run("not installed => empty, not a guess", func(t *testing.T) {
-		sysfsModuleVersion = func() (string, error) { return "", fs.ErrNotExist }
-		kernelModuleVersion = func() (string, error) { return "", errors.New("modinfo: ERROR: Module amneziawg not found") }
+	// modinfo answers for a .ko that cannot load at all (unsigned under Secure
+	// Boot, built for another kernel). The version is worth reporting; readiness
+	// is not — claiming it would hide the warning AND its install link until
+	// Turn on fails.
+	t.Run("on disk but not loaded => version reported, module still not-installed", func(t *testing.T) {
 		f := newFakeRunner()
 		m := newEnableManager(t, f)
+		m.SetKernelModuleInfo(func() KernelModuleInfo {
+			return KernelModuleInfo{Version: "3.0.20260731-04", Detected: true}
+		})
+		st := m.Status(context.Background())
+		if st.KernelModuleVersion != "3.0.20260731-04" {
+			t.Fatalf("KernelModuleVersion = %q, want the on-disk version", st.KernelModuleVersion)
+		}
+		if st.Module != StateNotInstalled {
+			t.Fatalf("Module = %q, want %q — a .ko on disk is not a module in the kernel", st.Module, StateNotInstalled)
+		}
+	})
+
+	t.Run("not installed => empty version and module not-installed", func(t *testing.T) {
+		f := newFakeRunner()
+		m := newEnableManager(t, f)
+		m.SetKernelModuleInfo(func() KernelModuleInfo { return KernelModuleInfo{} })
 		st := m.Status(context.Background())
 		if st.KernelModuleVersion != "" {
 			t.Fatalf("KernelModuleVersion = %q, want empty when the module is not installed", st.KernelModuleVersion)
 		}
+		if st.Module != StateNotInstalled {
+			t.Fatalf("Module = %q, want %q", st.Module, StateNotInstalled)
+		}
 	})
+
+	// The fail-closed read: the module IS loaded (the interface is up) but its
+	// version could not be read. The UI must not call that "not installed" —
+	// that is a red error over a running tunnel.
+	t.Run("loaded but version unreadable => empty version, module ready", func(t *testing.T) {
+		f := newFakeRunner()
+		f.outputs["awg show awg-rb0"] = "interface: awg-rb0\n  listening port: 51820\n"
+		m := newEnableManager(t, f)
+		m.SetKernelModuleInfo(func() KernelModuleInfo { return KernelModuleInfo{} })
+		st := m.Status(context.Background())
+		if st.KernelModuleVersion != "" {
+			t.Fatalf("KernelModuleVersion = %q, want empty — an unreadable version is not a guessable one", st.KernelModuleVersion)
+		}
+		if st.Module != StateReady {
+			t.Fatalf("Module = %q, want %q on a live interface", st.Module, StateReady)
+		}
+	})
+
+	// A .ko on disk is not a finished install: modinfo can already answer while
+	// the DKMS build is still running, and it keeps answering after a load that
+	// failed. Only a stale NotInstalled may be upgraded from a read version.
+	for _, tc := range []struct {
+		name  string
+		state State
+	}{
+		{"installing", StateInstalling},
+		{"failed", StateFailed},
+	} {
+		t.Run("detected version does not overwrite "+tc.name, func(t *testing.T) {
+			f := newFakeRunner()
+			m := newEnableManager(t, f)
+			m.module.setState(tc.state)
+			m.SetKernelModuleInfo(func() KernelModuleInfo {
+				return KernelModuleInfo{Version: "3.1.20260812", Detected: true, Loaded: true}
+			})
+			if st := m.Status(context.Background()); st.Module != tc.state {
+				t.Fatalf("Module = %q, want %q — a version on disk must not claim the install finished", st.Module, tc.state)
+			}
+		})
+	}
 }
 
 func TestEnableKernel_AWG3Capable_RendersHeaderProtectionAndCPA(t *testing.T) {

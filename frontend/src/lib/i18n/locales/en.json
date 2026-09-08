@@ -1858,6 +1858,7 @@
     "depNote": "Kernel module {module} — installs automatically when the server is enabled.",
     "depNoteVersion": "Kernel module installed — v{version}.",
     "installInstructions": "Other distributions: install instructions",
+    "depNoteVersionUnknown": "Kernel module installed — version unavailable.",
     "copyConfig": "Copy config",
     "copied": "Config copied to clipboard",
     "downloadConf": "Download .conf",
