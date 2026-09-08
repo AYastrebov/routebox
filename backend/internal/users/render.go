@@ -1,13 +1,25 @@
 package users
 
-import "sort"
+import (
+	"sort"
 
-// IsEffectivelyActive reports whether a user may currently connect: it is
-// enabled AND not past its expiry. ExpiresAt==0 means "never expires". Time is
-// unix seconds; at the exact boundary now==ExpiresAt the user is EXPIRED
-// (the comparison is strict now < ExpiresAt). PURE.
+	"routebox/backend/internal/quota"
+)
+
+// SuspendReason returns the single reason this user is out of service right now,
+// or quota.ReasonNone. The decision itself lives in the shared quota package so a
+// panel user and an AWG peer can never disagree about the same four numbers;
+// priority is manual → quota → expired (spec Q18). PURE.
+func SuspendReason(u PanelUser, now int64) quota.Reason {
+	return quota.State(u.QuotaBytes, u.UsedRx, u.UsedTx, u.Enabled, u.ExpiresAt, now)
+}
+
+// IsEffectivelyActive reports whether a user may currently connect: enabled, with
+// quota left and not past its expiry. QuotaBytes==0 means "no limit",
+// ExpiresAt==0 means "never expires". Time is unix seconds; at the exact boundary
+// now==ExpiresAt the user is EXPIRED. PURE.
 func IsEffectivelyActive(u PanelUser, now int64) bool {
-	return u.Enabled && (u.ExpiresAt == 0 || now < u.ExpiresAt)
+	return SuspendReason(u, now) == quota.ReasonNone
 }
 
 // userNames returns the deduped, non-blank inbound-user names a single panel
@@ -33,7 +45,8 @@ func userNames(u PanelUser) []string {
 
 // EffectiveRejectNames returns the sorted, de-duplicated set of inbound user
 // names that must be rejected right now: the union of userNames(u) over every
-// user that is NOT effectively active. Empty (nil) slice => no reject rule
+// user that is NOT effectively active (manually disabled, out of quota, or
+// expired — see SuspendReason). Empty (nil) slice => no reject rule
 // needed (every user active / no users). PURE.
 func EffectiveRejectNames(list []PanelUser, now int64) []string {
 	seen := map[string]bool{}

@@ -149,3 +149,83 @@ func TestUserDeltas_NewUserAlongsideExisting(t *testing.T) {
 		t.Errorf("bob = %+v, want full 7", d["bob"])
 	}
 }
+
+// TestSampleOnce_OnDeltasSink proves the optional sink receives exactly the
+// deltas that go to SQLite, so the panel-user accounting (quota) sees the same
+// numbers as the history store.
+func TestSampleOnce_OnDeltasSink(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+	s := NewUserSampler(store)
+
+	var got []map[string]UserDelta
+	s.OnDeltas = func(d map[string]UserDelta) { got = append(got, d) }
+
+	q := &fakeUserQuerier{snaps: []map[string]v2stats.Counters{
+		{"alice": {Uplink: 10, Downlink: 20}},
+		{"alice": {Uplink: 15, Downlink: 20}},
+		{"alice": {Uplink: 15, Downlink: 20}}, // no change → no call
+	}}
+	s.sampleOnce(q, time.Second, false)
+	s.sampleOnce(q, time.Second, false)
+	s.sampleOnce(q, time.Second, false)
+
+	if len(got) != 2 {
+		t.Fatalf("sink called %d times, want 2 (zero-delta tick must not call): %v", len(got), got)
+	}
+	if got[0]["alice"] != (UserDelta{Upload: 10, Download: 20}) {
+		t.Fatalf("first delta = %+v", got[0])
+	}
+	if got[1]["alice"] != (UserDelta{Upload: 5, Download: 0}) {
+		t.Fatalf("second delta = %+v", got[1])
+	}
+}
+
+// TestSampleOnce_NilStore_StillFeedsSink locks the "runnable without SQLite"
+// contract: a nil store skips the upserts but the sink still gets the deltas.
+func TestSampleOnce_NilStore_StillFeedsSink(t *testing.T) {
+	s := NewUserSampler(nil)
+	var got map[string]UserDelta
+	s.OnDeltas = func(d map[string]UserDelta) { got = d }
+
+	q := &fakeUserQuerier{snaps: []map[string]v2stats.Counters{
+		{"bob": {Uplink: 3, Downlink: 4}},
+	}}
+	if failed := s.sampleOnce(q, time.Second, false); failed {
+		t.Fatalf("nil store must not fail the tick")
+	}
+	if got["bob"] != (UserDelta{Upload: 3, Download: 4}) {
+		t.Fatalf("sink with nil store = %+v", got)
+	}
+}
+
+// TestRun_NilStore_StillSamples proves Run no longer bails out when there is no
+// SQLite store — the quota accounting must keep working without traffic.db.
+func TestRun_NilStore_StillSamples(t *testing.T) {
+	s := NewUserSampler(nil)
+	done := make(chan map[string]UserDelta, 1)
+	s.OnDeltas = func(d map[string]UserDelta) {
+		select {
+		case done <- d:
+		default:
+		}
+	}
+	q := &fakeUserQuerier{snaps: []map[string]v2stats.Counters{
+		{"carol": {Uplink: 1, Downlink: 2}},
+	}}
+	stop := make(chan struct{})
+	defer close(stop)
+	go s.Run(q, 1, 0, stop)
+
+	select {
+	case d := <-done:
+		if d["carol"] != (UserDelta{Upload: 1, Download: 2}) {
+			t.Fatalf("delta = %+v", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Run with a nil store never sampled")
+	}
+}

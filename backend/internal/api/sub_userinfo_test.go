@@ -83,3 +83,51 @@ func TestSub_UserinfoHeader_NoTraffic(t *testing.T) {
 		t.Errorf("Subscription-Userinfo = %q, want %q", got, want)
 	}
 }
+
+// TestSub_UserinfoHeader_TotalIsQuota is the ticket's third required test
+// (spec Q12): total= carries the panel user's quota, not a hard-coded 0.
+func TestSub_UserinfoHeader_TotalIsQuota(t *testing.T) {
+	h, um := newSubHandler(t, "vpn.example.com")
+
+	u := um.List()[0]
+	u.QuotaBytes = 10 << 30 // 10 GiB
+	u.ExpiresAt = 1893456000
+	if err := um.Put(&u); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := serveSub(h, u.Token, "203.0.113.13")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	want := "upload=0; download=0; total=10737418240; expire=1893456000"
+	if got := rec.Header().Get("Subscription-Userinfo"); got != want {
+		t.Errorf("Subscription-Userinfo = %q, want %q", got, want)
+	}
+}
+
+// TestSub_UserinfoHeader_QuotaExhausted_EmptyBodyStillReportsTotal proves the
+// suspended (quota) path emits the same total, so a client shows "0 left"
+// instead of "unlimited" while the subscription is empty.
+func TestSub_UserinfoHeader_QuotaExhausted_EmptyBodyStillReportsTotal(t *testing.T) {
+	h, um := newSubHandler(t, "vpn.example.com")
+
+	u := um.List()[0]
+	u.QuotaBytes = 1000
+	u.UsedRx, u.UsedTx = 600, 400
+	if err := um.Put(&u); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := serveSub(h, u.Token, "203.0.113.14")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("quota-exhausted user must get an empty body, got %q", body)
+	}
+	want := "upload=0; download=0; total=1000; expire=0"
+	if got := rec.Header().Get("Subscription-Userinfo"); got != want {
+		t.Errorf("Subscription-Userinfo = %q, want %q", got, want)
+	}
+}

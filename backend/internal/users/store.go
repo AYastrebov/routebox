@@ -29,8 +29,19 @@ type PanelUser struct {
 	// TokenDisabled marks a deliberately-revoked subscription. While true, the
 	// reconciler never auto-re-mints a token for this user (sticky revoke); a
 	// Rotate clears it (re-enables). Distinct from Enabled (Phase 4 lifecycle).
-	TokenDisabled bool      `toml:"token_disabled" json:"token_disabled"` // Phase 3
-	Bindings      []Binding `toml:"bindings" json:"bindings"`
+	TokenDisabled bool `toml:"token_disabled" json:"token_disabled"` // Phase 3
+	// QuotaBytes is the one-shot traffic limit on UsedRx+UsedTx; 0 = no limit.
+	// Reaching it suspends the user exactly like an expiry does (quota.State).
+	QuotaBytes int64 `toml:"quota_bytes" json:"quota_bytes"`
+	// UsedTx is what the client UPLOADED, UsedRx what it DOWNLOADED — the same
+	// order userAllTimeTraffic/formatUserinfo report up/down in. Cumulative since
+	// UsedResetAt, fed by the StatsService sampler (AddUsage), stored beside the
+	// user rather than derived from SQLite (spec Q7/Q15) so the limit survives a
+	// missing/pruned traffic.db.
+	UsedTx      int64     `toml:"used_tx" json:"used_tx"`
+	UsedRx      int64     `toml:"used_rx" json:"used_rx"`
+	UsedResetAt int64     `toml:"used_reset_at" json:"used_reset_at"` // unix; 0 = never reset
+	Bindings    []Binding `toml:"bindings" json:"bindings"`
 }
 
 // Binding ties a PanelUser to a credential inside one server inbound. Name/Flow

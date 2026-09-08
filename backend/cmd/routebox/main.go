@@ -345,27 +345,6 @@ func main() {
 		go sampler.Run(resolvedClashAddr, resolvedClashSecret, 35, stopSampler)
 	}
 
-	// Per-user StatsService sampler (v2ray_api). No-op without a store; graceful
-	// (no crash / no log spam) if the running binary lacks with_v2ray_api or the
-	// addr is unreachable — counters simply stay flat. The addr is resolved from
-	// settings (loopback gRPC StatsService listen), defaulting to 127.0.0.1:8081.
-	v2rayAPIAddr := cfg.Singbox.V2RayAPI
-	if v2rayAPIAddr == "" {
-		v2rayAPIAddr = "127.0.0.1:8081"
-	}
-	stopUserSampler := make(chan struct{})
-	if trafficStore != nil {
-		if client, err := v2stats.Dial(v2rayAPIAddr); err != nil {
-			log.Printf("Warning: v2ray_api dial %s failed: %v", v2rayAPIAddr, err)
-		} else {
-			userSampler := traffic.NewUserSampler(trafficStore)
-			go func() {
-				userSampler.Run(client, 30, 35, stopUserSampler)
-				client.Close()
-			}()
-		}
-	}
-
 	// Updates: GitHub release checker + daily auto-check (Task 4 adds API)
 	updChecker := updates.NewChecker()
 	updUpdater := updates.NewUpdater()
@@ -411,6 +390,41 @@ func main() {
 	// Startup reconcile against the active config (additive: empty active -> no-op).
 	if _, err := usersMgr.Reconcile(cfgMgr.GetActive()); err != nil {
 		log.Printf("Warning: startup users reconcile failed: %v", err)
+	}
+
+	// Per-user StatsService sampler (v2ray_api). Graceful (no crash / no log spam)
+	// if the running binary lacks with_v2ray_api or the addr is unreachable —
+	// counters simply stay flat. The addr is resolved from settings (loopback gRPC
+	// StatsService listen), defaulting to 127.0.0.1:8081.
+	v2rayAPIAddr := cfg.Singbox.V2RayAPI
+	if v2rayAPIAddr == "" {
+		v2rayAPIAddr = "127.0.0.1:8081"
+	}
+	// It runs even without traffic.db: the SQLite history is one consumer, the
+	// panel-user quota counters (stored beside the users) are the other, and the
+	// quota must keep counting on an install with no history store.
+	stopUserSampler := make(chan struct{})
+	if client, err := v2stats.Dial(v2rayAPIAddr); err != nil {
+		log.Printf("Warning: v2ray_api dial %s failed: %v", v2rayAPIAddr, err)
+	} else {
+		userSampler := traffic.NewUserSampler(trafficStore)
+		// Feed the same deltas into the panel users' cumulative quota counters.
+		// The 30s expiry ticker below recomputes the reject set from the current
+		// list on every tick, so a user that just used up its quota is suspended
+		// within one tick without any extra plumbing here.
+		userSampler.OnDeltas = func(deltas map[string]traffic.UserDelta) {
+			byName := make(map[string]struct{ Up, Down int64 }, len(deltas))
+			for name, d := range deltas {
+				byName[name] = struct{ Up, Down int64 }{Up: d.Upload, Down: d.Download}
+			}
+			if _, err := usersMgr.AddUsage(byName); err != nil {
+				log.Printf("users: traffic accounting write failed: %v", err)
+			}
+		}
+		go func() {
+			userSampler.Run(client, 30, 35, stopUserSampler)
+			client.Close()
+		}()
 	}
 
 	// Initialize API handlers

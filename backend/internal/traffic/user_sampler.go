@@ -26,10 +26,18 @@ type UserSampler struct {
 	store    *Store
 	mu       sync.Mutex
 	lastSeen map[string]v2stats.Counters
+
+	// OnDeltas, when set, receives the SAME deltas the SQLite upserts get, right
+	// after them, keyed by inbound user name. It is how the panel-user quota
+	// counters are fed (users.Manager.AddUsage) without the accounting depending on
+	// traffic.db existing. Called only on non-empty batches, from the sampler
+	// goroutine; set it before Run and never during.
+	OnDeltas func(map[string]UserDelta)
 }
 
-// NewUserSampler constructs a sampler. A nil store makes Run a no-op (additivity:
-// no traffic.db => no per-user accounting, exactly like Sampler).
+// NewUserSampler constructs a sampler. A nil store only turns off the SQLite
+// history half: the sampler still polls and still feeds OnDeltas, because the
+// quota counters live beside the users, not in traffic.db.
 func NewUserSampler(store *Store) *UserSampler {
 	return &UserSampler{store: store, lastSeen: map[string]v2stats.Counters{}}
 }
@@ -97,17 +105,21 @@ func (s *UserSampler) sampleOnce(query userQuerier, timeout time.Duration, faile
 			}
 		}
 	}
+	if s.OnDeltas != nil && len(deltas) > 0 {
+		s.OnDeltas(deltas)
+	}
 	return false
 }
 
 // Run polls the StatsService every intervalSec, writing per-minute deltas, and
-// prunes hourly. No-op if store or query is nil. Graceful: the FIRST query
+// prunes hourly. No-op only if query is nil — a nil store skips the SQLite
+// history (and the prune) but keeps sampling for OnDeltas. Graceful: the FIRST query
 // failure logs once, subsequent consecutive failures are silent (no spam) until
 // a success resets the gate — so an old binary without with_v2ray_api, or an
 // unreachable addr, leaves counters flat without crashing or flooding the log.
 // The log gate is a LOCAL var (not a struct field) to avoid a data race.
 func (s *UserSampler) Run(query userQuerier, intervalSec, retentionDays int, stop <-chan struct{}) {
-	if s.store == nil || query == nil {
+	if query == nil {
 		return
 	}
 	if intervalSec <= 0 {
@@ -129,7 +141,7 @@ func (s *UserSampler) Run(query userQuerier, intervalSec, retentionDays int, sto
 
 	doSample := func() { failed = s.sampleOnce(query, to, failed) }
 	doPrune := func() {
-		if retentionDays <= 0 {
+		if s.store == nil || retentionDays <= 0 {
 			return
 		}
 		cutoff := time.Now().Unix() - int64(retentionDays)*86400

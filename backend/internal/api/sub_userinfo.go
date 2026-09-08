@@ -7,7 +7,7 @@ import (
 )
 
 // formatUserinfo renders the Subscription-Userinfo header value per the
-// SIP008 / clash-meta convention. total=0 means "no quota" (Phase 5 read-only).
+// SIP008 / clash-meta convention. total is the user's QuotaBytes; 0 = no quota.
 // PURE.
 func formatUserinfo(up, down, total, expire int64) string {
 	return fmt.Sprintf("upload=%d; download=%d; total=%d; expire=%d", up, down, total, expire)

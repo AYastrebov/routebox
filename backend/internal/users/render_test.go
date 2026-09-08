@@ -1,6 +1,10 @@
 package users
 
-import "testing"
+import (
+	"testing"
+
+	"routebox/backend/internal/quota"
+)
 
 func TestIsEffectivelyActive(t *testing.T) {
 	const now = int64(1000)
@@ -234,4 +238,72 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestSuspendReason_Priority pins the shared quota.State priority (manual →
+// quota → expired → none) as it reads off a PanelUser.
+func TestSuspendReason_Priority(t *testing.T) {
+	const now = int64(1000)
+	cases := []struct {
+		name string
+		u    PanelUser
+		want quota.Reason
+	}{
+		{"active, no limits", PanelUser{Enabled: true}, quota.ReasonNone},
+		{"active under quota", PanelUser{Enabled: true, QuotaBytes: 100, UsedRx: 40, UsedTx: 50}, quota.ReasonNone},
+		{"disabled beats quota and expiry",
+			PanelUser{Enabled: false, QuotaBytes: 100, UsedRx: 100, ExpiresAt: now - 1}, quota.ReasonManual},
+		{"quota beats expiry",
+			PanelUser{Enabled: true, QuotaBytes: 100, UsedRx: 60, UsedTx: 40, ExpiresAt: now - 1}, quota.ReasonQuota},
+		{"quota exactly reached", PanelUser{Enabled: true, QuotaBytes: 100, UsedTx: 100}, quota.ReasonQuota},
+		{"expired only", PanelUser{Enabled: true, ExpiresAt: now}, quota.ReasonExpired},
+		{"zero quota is no limit", PanelUser{Enabled: true, UsedRx: 1 << 40, UsedTx: 1 << 40}, quota.ReasonNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SuspendReason(tc.u, now); got != tc.want {
+				t.Fatalf("SuspendReason = %q, want %q", got, tc.want)
+			}
+			if active := IsEffectivelyActive(tc.u, now); active != (tc.want == quota.ReasonNone) {
+				t.Fatalf("IsEffectivelyActive = %v, inconsistent with reason %q", active, tc.want)
+			}
+		})
+	}
+}
+
+// TestEffectiveRejectNames_Quota is the ticket's second required test: a user
+// that used up its quota is rejected under every name it answers to, and raising
+// the limit re-admits it immediately (Q19).
+func TestEffectiveRejectNames_Quota(t *testing.T) {
+	const now = int64(1000)
+	alice := PanelUser{
+		ID: "a", Name: "alice", Enabled: true,
+		QuotaBytes: 1000, UsedRx: 600, UsedTx: 400,
+		Bindings: []Binding{{Name: "alice"}, {Name: "alice-trojan"}},
+	}
+	bob := PanelUser{ID: "b", Name: "bob", Enabled: true, QuotaBytes: 1000, UsedRx: 1}
+
+	got := EffectiveRejectNames([]PanelUser{alice, bob}, now)
+	want := []string{"alice", "alice-trojan"}
+	if !equalStrings(got, want) {
+		t.Fatalf("quota-exhausted reject names = %v, want %v", got, want)
+	}
+
+	// Q19: raise the limit → back in service on the very next recomputation.
+	alice.QuotaBytes = 2000
+	if got := EffectiveRejectNames([]PanelUser{alice, bob}, now); len(got) != 0 {
+		t.Fatalf("raising the limit must clear the reject set, got %v", got)
+	}
+
+	// Q20: lower it below what is already used → suspended again.
+	alice.QuotaBytes = 500
+	if got := EffectiveRejectNames([]PanelUser{alice, bob}, now); !equalStrings(got, want) {
+		t.Fatalf("lowering the limit below used must suspend, got %v", got)
+	}
+
+	// Resetting the counters re-admits too.
+	alice.UsedRx, alice.UsedTx = 0, 0
+	if got := EffectiveRejectNames([]PanelUser{alice, bob}, now); len(got) != 0 {
+		t.Fatalf("resetting the counters must clear the reject set, got %v", got)
+	}
 }
