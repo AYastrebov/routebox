@@ -390,24 +390,12 @@ func (h *Handler) SetAWGPeerExpiry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "quota_bytes must be >= 0 (0 = no limit)")
 		return
 	}
-	// Fill the omitted half from the store. Both limits travel to SetPeerLimits
-	// together (it writes them under the same lock the sweep uses), so the peer
-	// has to be read first; the read is outside that lock, but the only writers
-	// of these two fields are operator actions, and two of those racing on the
-	// same peer is a person fighting themselves.
-	p, ok := h.awg.Store().Get(pub)
-	if !ok {
-		writeError(w, http.StatusNotFound, "peer not found")
-		return
-	}
-	expiresAt, quotaBytes := p.ExpiresAt, p.QuotaBytes
-	if body.ExpiresAt != nil {
-		expiresAt = *body.ExpiresAt
-	}
-	if body.QuotaBytes != nil {
-		quotaBytes = *body.QuotaBytes
-	}
-	if err := h.awg.SetPeerLimits(r.Context(), pub, expiresAt, quotaBytes); err != nil {
+	// The pointers go through UNRESOLVED: SetPeerLimits fills the omitted half
+	// from the store under the same lock it writes with. Reading it here instead
+	// would lose the other operator's edit whenever the lock is busy (the 30s
+	// sweep, or another change's singbox apply) — and two rows in the UI mean two
+	// people saving different halves of the same peer is a normal Tuesday.
+	if err := h.awg.SetPeerLimits(r.Context(), pub, body.ExpiresAt, body.QuotaBytes); err != nil {
 		if errors.Is(err, awg.ErrPeerNotFound) {
 			writeError(w, http.StatusNotFound, "peer not found")
 			return

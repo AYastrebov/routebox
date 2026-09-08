@@ -56,7 +56,7 @@ func TestSingbox_SetPeerLimits_ReadOnlyConfigKeepsTheOldExpiry(t *testing.T) {
 	}
 	fs.err = errRO()
 
-	if err := m.SetPeerLimits(context.Background(), sum.PublicKey, 4102444800, 0); err == nil {
+	if err := m.SetPeerLimits(context.Background(), sum.PublicKey, i64(4102444800), nil); err == nil {
 		t.Fatal("SetPeerLimits must fail when the endpoint cannot be rewritten")
 	}
 	p, ok := m.store.Get(sum.PublicKey)

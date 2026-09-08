@@ -142,6 +142,10 @@ func seedConf(t *testing.T, m *Manager) {
 const validPub = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEs="
 const otherValidPub = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI="
 
+// i64 is the "set this limit" argument of SetPeerLimits; a bare nil is "keep the
+// stored one".
+func i64(v int64) *int64 { return &v }
+
 func TestSetPeerLimitsReadmitsSuspended(t *testing.T) {
 	f := newFakeRunner()
 	m := newTestManager(t, f)
@@ -150,7 +154,7 @@ func TestSetPeerLimitsReadmitsSuspended(t *testing.T) {
 	// a suspended peer: expired, off the conf, secret retained
 	_ = m.store.Put(Peer{PublicKey: validPub, PresharedKey: "psk", Address: "10.10.0.2/32", Name: "bob", ExpiresAt: 500})
 
-	if err := m.SetPeerLimits(context.Background(), validPub, 5000, 0); err != nil {
+	if err := m.SetPeerLimits(context.Background(), validPub, i64(5000), nil); err != nil {
 		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	// stored expiry updated
@@ -172,7 +176,7 @@ func TestSetPeerLimitsReadmitsSuspended(t *testing.T) {
 func TestSetPeerLimitsUnknown(t *testing.T) {
 	m := newTestManager(t, newFakeRunner())
 	seedConf(t, m)
-	if err := m.SetPeerLimits(context.Background(), otherValidPub, 5000, 0); err != ErrPeerNotFound {
+	if err := m.SetPeerLimits(context.Background(), otherValidPub, i64(5000), nil); err != ErrPeerNotFound {
 		t.Fatalf("want ErrPeerNotFound, got %v", err)
 	}
 }
@@ -251,7 +255,7 @@ func TestSetPeerLimitsNoDuplicateConfBlock(t *testing.T) {
 	_ = m.store.Put(Peer{PublicKey: validPub, PresharedKey: "psk", Address: "10.10.0.2/32", Name: "bob", ExpiresAt: 5000})
 	m.appendPeerToConf(PeerLine{Name: "bob", PublicKey: validPub, PSK: "psk", AllowedIP: "10.10.0.2/32"})
 
-	if err := m.SetPeerLimits(context.Background(), validPub, 9000, 0); err != nil {
+	if err := m.SetPeerLimits(context.Background(), validPub, i64(9000), nil); err != nil {
 		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	data, _ := os.ReadFile(m.confPath)

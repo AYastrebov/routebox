@@ -237,12 +237,12 @@ func TestSetPeerLimitsRaisingQuotaAdmitsImmediately(t *testing.T) {
 		QuotaBytes: 100, UsedRx: 200,
 	})
 
-	if err := m.SetPeerLimits(ctx, validPub, 0, 1000); err != nil {
+	if err := m.SetPeerLimits(ctx, validPub, nil, i64(1000)); err != nil {
 		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	got, _ := m.store.Get(validPub)
 	if got.QuotaBytes != 1000 || got.ExpiresAt != 0 {
-		t.Fatalf("both limits must be persisted: %+v", got)
+		t.Fatalf("the new limit must be persisted, the untouched date left alone: %+v", got)
 	}
 	if !f.sawContains("awg set awg-rb0 peer " + validPub) {
 		t.Fatalf("expected an immediate re-admit; calls=%v", f.calls)
@@ -267,7 +267,7 @@ func TestSetPeerLimitsLoweringQuotaSuspendsImmediately(t *testing.T) {
 	})
 	m.appendPeerToConf(PeerLine{Name: "bob", PublicKey: validPub, PSK: "psk", AllowedIP: "10.10.0.2/32"})
 
-	if err := m.SetPeerLimits(ctx, validPub, 0, 100); err != nil {
+	if err := m.SetPeerLimits(ctx, validPub, nil, i64(100)); err != nil {
 		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	if !f.sawContains("awg set awg-rb0 peer " + validPub + " remove") {
@@ -275,6 +275,47 @@ func TestSetPeerLimitsLoweringQuotaSuspendsImmediately(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(m.confPath); strings.Contains(string(data), "PublicKey = "+validPub) {
 		t.Fatalf("peer must be out of the conf:\n%s", data)
+	}
+}
+
+// A nil argument keeps the stored value, and the halves are resolved INSIDE the
+// lock — that is the whole reason the handler passes its body pointers through
+// instead of reading the peer itself: an expiry-only save must not write back a
+// quota it read before the other operator's quota-only save landed.
+func TestSetPeerLimitsNilKeepsTheStoredValue(t *testing.T) {
+	ctx := context.Background()
+	m := newTestManager(t, newFakeRunner())
+	seedConf(t, m)
+	m.store.now = func() int64 { return 1000 }
+	seedUsagePeer(t, m, Peer{
+		PublicKey: validPub, PresharedKey: "psk", Address: "10.10.0.2/32", Name: "bob",
+		ExpiresAt: 500, QuotaBytes: 4096, UsedRx: 10,
+	})
+
+	// The expiry row: date only.
+	if err := m.SetPeerLimits(ctx, validPub, i64(5000), nil); err != nil {
+		t.Fatalf("SetPeerLimits: %v", err)
+	}
+	got, _ := m.store.Get(validPub)
+	if got.ExpiresAt != 5000 || got.QuotaBytes != 4096 || got.UsedRx != 10 {
+		t.Fatalf("an expiry-only save must move only the date: %+v", got)
+	}
+
+	// The quota row: limit only.
+	if err := m.SetPeerLimits(ctx, validPub, nil, i64(8192)); err != nil {
+		t.Fatalf("SetPeerLimits: %v", err)
+	}
+	got, _ = m.store.Get(validPub)
+	if got.QuotaBytes != 8192 || got.ExpiresAt != 5000 || got.UsedRx != 10 {
+		t.Fatalf("a quota-only save must move only the limit: %+v", got)
+	}
+
+	// Both nil: a no-op that still cannot lose anything.
+	if err := m.SetPeerLimits(ctx, validPub, nil, nil); err != nil {
+		t.Fatalf("SetPeerLimits: %v", err)
+	}
+	if got, _ = m.store.Get(validPub); got.ExpiresAt != 5000 || got.QuotaBytes != 8192 {
+		t.Fatalf("two nils must change nothing: %+v", got)
 	}
 }
 

@@ -120,7 +120,8 @@ func TestSetPeerLimitsDoesNotReadmitQuotaExhausted(t *testing.T) {
 		ExpiresAt: 500, QuotaBytes: 1024, UsedRx: 2048,
 	})
 
-	if err := m.SetPeerLimits(context.Background(), validPub, 5000, 1024); err != nil {
+	// Exactly what the expiry row sends: a new date, quota left alone (nil).
+	if err := m.SetPeerLimits(context.Background(), validPub, i64(5000), nil); err != nil {
 		t.Fatalf("SetPeerLimits: %v", err)
 	}
 	if got, _ := m.store.Get(validPub); got.ExpiresAt != 5000 {

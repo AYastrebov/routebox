@@ -990,21 +990,30 @@ func (m *Manager) RemovePeer(ctx context.Context, pub string) (string, error) {
 	return addr, nil
 }
 
-// SetPeerLimits writes BOTH of a peer's limits — the expiry date and the traffic
-// quota — and immediately brings the interface in line with the verdict they
-// produce. expiresAt is 0 (never) or a unix ts, quotaBytes 0 (no limit) or a byte
-// count; the handler validates. ErrPeerNotFound if unknown.
+// SetPeerLimits writes EITHER OR BOTH of a peer's limits — the expiry date and
+// the traffic quota — and immediately brings the interface in line with the
+// verdict they produce. expiresAt is 0 (never) or a unix ts, quotaBytes 0 (no
+// limit) or a byte count; the handler validates the values. ErrPeerNotFound if
+// unknown.
 //
-// The two are independent tools (spec Q16), which is why they are written
-// together rather than by two endpoints that would each have to guess the other's
-// value: a peer suspended on quota does not come back because its date moved, and
-// a peer suspended on date does not come back because its limit was raised.
+// Both arguments are POINTERS, and nil means "keep what is stored". The peer's
+// two limits are driven by two independent controls (spec Q16/Q22), so a caller
+// that only wants to move one of them must not have to send the other — and it
+// MUST NOT read the other one for itself: the read would sit outside addMu, and
+// while the lock is held by the 30s sweep or by another change's singbox apply
+// (seconds of network work), a second operator's edit lands in between and is
+// silently written back to its old value. Resolving the omitted half here, under
+// the same lock as the write, is what makes two people editing one peer safe.
+//
+// The two limits stay independent tools: a peer suspended on quota does not come
+// back because its date moved, and a peer suspended on date does not come back
+// because its limit was raised.
 //
 // Both are applied at save time, not at the next tick (spec Q19/Q20): raising a
 // limit or extending a date re-admits a peer that has nothing else holding it
 // back, and lowering a limit below what is already spent takes it off now. A tick
 // would do the suspend side eventually and the admit side never.
-func (m *Manager) SetPeerLimits(ctx context.Context, pub string, expiresAt int64, quotaBytes int64) error {
+func (m *Manager) SetPeerLimits(ctx context.Context, pub string, expiresAt, quotaBytes *int64) error {
 	if _, err := ValidatePublicKey(pub); err != nil {
 		return err
 	}
@@ -1015,7 +1024,12 @@ func (m *Manager) SetPeerLimits(ctx context.Context, pub string, expiresAt int64
 		return ErrPeerNotFound
 	}
 	prev := p
-	p.ExpiresAt, p.QuotaBytes = expiresAt, quotaBytes
+	if expiresAt != nil {
+		p.ExpiresAt = *expiresAt
+	}
+	if quotaBytes != nil {
+		p.QuotaBytes = *quotaBytes
+	}
 	if err := m.store.Put(p); err != nil {
 		return err
 	}

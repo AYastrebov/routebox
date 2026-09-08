@@ -42,7 +42,7 @@ func TestKernelSetPeerLimitsRestoresTheExpiryWhenAdmitFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := m.SetPeerLimits(ctx, sum.PublicKey, 4102444800, 0); err == nil {
+	if err := m.SetPeerLimits(ctx, sum.PublicKey, i64(4102444800), nil); err == nil {
 		t.Fatal("SetPeerLimits must fail when the peer cannot be re-admitted")
 	}
 
@@ -71,7 +71,7 @@ func TestKernelSetPeerLimitsKeepsTheNewExpiryOnSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	const until = int64(4102444800)
-	if err := m.SetPeerLimits(ctx, sum.PublicKey, until, 0); err != nil {
+	if err := m.SetPeerLimits(ctx, sum.PublicKey, i64(until), nil); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := m.store.Get(sum.PublicKey)
