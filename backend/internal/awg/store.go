@@ -196,7 +196,8 @@ func (s *Store) Put(p Peer) error {
 }
 
 // AddUsage folds per-peer byte deltas into the cumulative UsedRx/UsedTx counters
-// in ONE atomic write, and writes nothing at all when every delta is zero.
+// in ONE atomic write. changed reports whether any counter moved — false means
+// nothing was written and the error is meaningless.
 //
 // One write, not a Put per peer, because this runs every 30s forever on a router
 // whose peers.toml sits on flash: a box with twenty busy peers would otherwise
@@ -206,10 +207,19 @@ func (s *Store) Put(p Peer) error {
 // Deltas are already reset-corrected by the caller (see Manager.accountUsageLocked);
 // this only adds. Keys the store does not know are ignored: a peer deleted
 // between the snapshot and here is gone, not resurrected.
-func (s *Store) AddUsage(deltas map[string]peerXfer) error {
+//
+// A FAILED SAVE DOES NOT ROLL THE COUNTERS BACK, unlike every other writer here
+// (spec Q7). The others compensate because their in-memory value would otherwise
+// claim something the served config does not carry. This one is the opposite: the
+// counters ARE the enforcement — Peer.Suspended reads them — so on a read-only
+// peers.toml, rolling back would hand every client an unlimited allowance for as
+// long as the install stays read-only. The caller has already advanced its
+// reference snapshot by then, so these bytes have no second chance; keeping them
+// costs at most a restart's worth of usage, discarding them costs the quota.
+// The next successful write persists the whole running total anyway.
+func (s *Store) AddUsage(deltas map[string]peerXfer) (changed bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prev := map[string]Peer{}
 	for pk, d := range deltas {
 		if d.rx == 0 && d.tx == 0 {
 			continue
@@ -218,21 +228,14 @@ func (s *Store) AddUsage(deltas map[string]peerXfer) error {
 		if !ok {
 			continue
 		}
-		prev[pk] = *p
 		p.UsedRx += d.rx
 		p.UsedTx += d.tx
+		changed = true
 	}
-	if len(prev) == 0 {
-		return nil // nothing moved: leave the file alone
+	if !changed {
+		return false, nil // nothing moved: leave the file alone
 	}
-	if err := s.saveLocked(); err != nil {
-		for pk := range prev {
-			restored := prev[pk]
-			s.byPK[pk] = &restored
-		}
-		return err
-	}
-	return nil
+	return true, s.saveLocked()
 }
 
 // Replace swaps the whole store for a backup's content and persists; on save

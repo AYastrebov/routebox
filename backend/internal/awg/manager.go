@@ -195,12 +195,29 @@ type Manager struct {
 	// a roster poll swallow the sweep's first report. Touched only under mu.
 	lastUsageStatsErr string
 
+	// lastUsageWriteErr is the same gate again, for peers.toml failing to take
+	// the counters. The write is allowed to fail without losing them (see
+	// Store.AddUsage), which is exactly why it has to be said out loud — and said
+	// once, plus once more when it starts working. Touched only under mu.
+	lastUsageWriteErr string
+
 	// lastXfer is the previous LIVE byte snapshot per public key, the reference
-	// the sweep diffs against to top up Peer.UsedRx/UsedTx. It lives in memory
-	// only, so the first tick after a restart has no reference and counts the
-	// whole current value (the interface may well have been up without us).
-	// Guarded by addMu, like everything else the sweep's accounting touches.
-	lastXfer map[string]peerXfer
+	// the sweep diffs against to top up Peer.UsedRx/UsedTx; usagePrimed says
+	// whether any snapshot has been taken in this process at all.
+	//
+	// The reference lives in memory only, and the tunnel does not: a kernel
+	// Rehydrate adopts a running awg-rb0, a sing-box sync is change-gated and
+	// leaves the endpoint alone. So the counters we find on the FIRST snapshot
+	// after a restart already sit inside the stored totals, and counting them
+	// would double a peer's usage on every upgrade. usagePrimed is what makes
+	// that first snapshot a reference rather than a bill (spec Q7). A pubkey
+	// that first shows up in a LATER snapshot is a different case — a new or
+	// re-admitted peer, counting from a fresh counter — and does count in full.
+	//
+	// Both are guarded by addMu, like everything else the sweep's accounting
+	// touches.
+	lastXfer    map[string]peerXfer
+	usagePrimed bool
 
 	// livenessFn answers "when did this tunnel IP last move bytes", and exists
 	// for the singbox backend as a fallback for amnezia-box binaries that
@@ -1114,23 +1131,30 @@ func (m *Manager) applySuspensionChange(ctx context.Context, prev, next Peer) er
 //   - cur < last: the counter was reset under us (interface restarted, endpoint
 //     re-created), so everything it now reports was moved since — the delta is
 //     the whole current value, not a negative number.
-//   - no last value: the first tick after a RouteBox restart. The interface may
-//     have been up the whole time without us, so the current value counts in
-//     full. It over-counts only what a previous process already recorded, and
-//     the alternative — starting the reference at the current value — silently
-//     forgives a peer everything it spent while the panel was down.
+//   - the very first snapshot of the process: no deltas at all, it only fills
+//     the reference. The tunnel outlives RouteBox, so what it reports now is
+//     already inside the stored totals; billing it again turned 80 GB into 160
+//     on the first tick after every upgrade.
+//   - a pubkey seen for the first time in a LATER snapshot: the whole current
+//     value counts. That is a peer just added or re-admitted, and its counter
+//     started from zero when it was.
 //   - peer absent from the snapshot: no delta, and its reference is forgotten,
-//     so a re-admitted peer counts from its fresh counter instead of being
+//     so a returning peer counts from its fresh counter instead of being
 //     diffed against a stale high-water mark it will never reach again.
 func (m *Manager) accountUsageLocked(cur map[string]peerXfer) {
 	if m.lastXfer == nil {
 		m.lastXfer = map[string]peerXfer{}
 	}
+	primed := m.usagePrimed
+	m.usagePrimed = true
 	deltas := make(map[string]peerXfer, len(cur))
 	for pk, x := range cur {
 		last, seen := m.lastXfer[pk]
 		d := x
-		if seen {
+		switch {
+		case !primed:
+			d = peerXfer{} // reference only
+		case seen:
 			if x.rx >= last.rx {
 				d.rx = x.rx - last.rx
 			}
@@ -1146,14 +1170,33 @@ func (m *Manager) accountUsageLocked(cur map[string]peerXfer) {
 			delete(m.lastXfer, pk)
 		}
 	}
-	if err := m.store.AddUsage(deltas); err != nil {
-		// A read-only peers.toml is a standing condition reported elsewhere (see
-		// the sweep's singboxSync note); anything else is a counter that did not
-		// land, which means a quota that will not be enforced.
-		if !errors.Is(err, config.ErrReadOnly) {
-			log.Printf("awg: record peer usage: %v", err)
-		}
+	// The reference above is advanced whether or not the write below lands, which
+	// is why AddUsage keeps the counters in memory on failure: these bytes get no
+	// second snapshot to be counted from.
+	changed, err := m.store.AddUsage(deltas)
+	if !changed {
+		return // nothing was written, so there is nothing to report either way
 	}
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	m.mu.Lock()
+	report := msg != m.lastUsageWriteErr
+	m.lastUsageWriteErr = msg
+	m.mu.Unlock()
+	if !report {
+		return
+	}
+	if err != nil {
+		// Gated like the stats fetch: a read-only install would otherwise say this
+		// every 30 seconds for the rest of its life. Said at all, though — unlike
+		// the sweep's singboxSync, this failure has a consequence that outlives the
+		// tick (the counters and the disk have drifted apart).
+		log.Printf("awg: peer usage counters kept in memory only, peers.toml write failed: %v", err)
+		return
+	}
+	log.Printf("awg: peers.toml is writable again, peer usage counters persisted")
 }
 
 // usageSnapshotSingbox reads the fork's per-peer stats route — the same call
@@ -1236,15 +1279,21 @@ func (m *Manager) SweepExpired(ctx context.Context) {
 			}
 			probeResult = probe()
 		}
+		// The byte snapshot is a network call too (a 5s-capped loopback fetch), so
+		// it keeps the probe's company OUTSIDE addMu rather than stalling every
+		// concurrent AddPeer for its duration. Only the fold below needs the lock:
+		// it is the read-modify-write of the store that a concurrent quota change
+		// would be lost by. A peer suspended between the fetch and the fold is no
+		// problem — the bytes are real, and it drops out of the next snapshot,
+		// which forgets it.
+		cur, curOK := m.usageSnapshotSingbox()
 
 		m.addMu.Lock()
 		defer m.addMu.Unlock()
-		// Byte accounting first: singboxSync renders the endpoint from the store,
-		// so folding the deltas in here means the same sync that runs below also
-		// drops whoever just ran out. The fetch is a 5s-capped loopback call and
-		// it is made under addMu on purpose — snapshot, deltas and store write
-		// have to be one critical section or a concurrent quota change is lost.
-		if cur, ok := m.usageSnapshotSingbox(); ok {
+		// Accounting first: singboxSync renders the endpoint from the store, so
+		// folding the deltas in here means the same sync that runs below also drops
+		// whoever just ran out.
+		if curOK {
 			m.accountUsageLocked(cur)
 		}
 		// The probe result is a state commit ahead of a write, so it follows the

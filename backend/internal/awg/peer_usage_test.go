@@ -1,8 +1,10 @@
 package awg
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"os"
 	"strings"
 	"testing"
@@ -30,35 +32,44 @@ func TestSweepAccumulatesUsageDeltas(t *testing.T) {
 	m := newTestManager(t, f)
 	seedConf(t, m)
 	m.store.now = func() int64 { return 2000 }
-	seedUsagePeer(t, m, Peer{PublicKey: "P", PresharedKey: "p", Address: "10.10.0.2/32"})
+	seedUsagePeer(t, m, Peer{PublicKey: "P", PresharedKey: "p", Address: "10.10.0.2/32", UsedRx: 4000, UsedTx: 3000})
 
-	// First snapshot after process start: the interface may have been up without
-	// us, so the whole current value is ours to count.
+	// The FIRST snapshot of the process only primes the reference. The tunnel
+	// outlives RouteBox — a kernel Rehydrate adopts a live awg-rb0, a singbox
+	// sync is change-gated — so its counters already include everything the
+	// stored totals hold, and counting them again would double a peer's usage on
+	// every restart.
 	f.outputs["awg show awg-rb0 transfer"] = "P\t100\t50\n"
 	m.SweepExpired(ctx)
-	if got, _ := m.store.Get("P"); got.UsedRx != 100 || got.UsedTx != 50 {
-		t.Fatalf("first tick: used = %d/%d, want 100/50", got.UsedRx, got.UsedTx)
+	if got, _ := m.store.Get("P"); got.UsedRx != 4000 || got.UsedTx != 3000 {
+		t.Fatalf("the priming tick must not count anything: used = %d/%d, want 4000/3000", got.UsedRx, got.UsedTx)
 	}
 
 	// Steady state: only the delta.
 	f.outputs["awg show awg-rb0 transfer"] = "P\t250\t80\n"
 	m.SweepExpired(ctx)
-	if got, _ := m.store.Get("P"); got.UsedRx != 250 || got.UsedTx != 80 {
-		t.Fatalf("second tick: used = %d/%d, want 250/80", got.UsedRx, got.UsedTx)
+	if got, _ := m.store.Get("P"); got.UsedRx != 4150 || got.UsedTx != 3030 {
+		t.Fatalf("second tick: used = %d/%d, want 4150/3030", got.UsedRx, got.UsedTx)
 	}
 
 	// Interface restarted: the live counter is lower than the last snapshot, so
 	// the current value IS the delta — the stored totals never go down.
 	f.outputs["awg show awg-rb0 transfer"] = "P\t30\t10\n"
 	m.SweepExpired(ctx)
-	if got, _ := m.store.Get("P"); got.UsedRx != 280 || got.UsedTx != 90 {
-		t.Fatalf("after a counter reset: used = %d/%d, want 280/90", got.UsedRx, got.UsedTx)
+	if got, _ := m.store.Get("P"); got.UsedRx != 4180 || got.UsedTx != 3040 {
+		t.Fatalf("after a counter reset: used = %d/%d, want 4180/3040", got.UsedRx, got.UsedTx)
 	}
 }
 
 // A peer that drops out of the live snapshot (suspended, or the interface
 // forgot it) contributes no delta, and its last value is forgotten so that
 // re-admission counts from its fresh counter instead of a stale high-water mark.
+//
+// The return value is deliberately ABOVE the forgotten reference: at 7 against a
+// remembered 500 the reset rule (cur < last -> cur) would give the same answer,
+// and the test would pass with the forgetting removed. At 600 the two rules
+// disagree — forgotten means +600, remembered means +100 — so only one of them
+// can make it green.
 func TestSweepForgetsPeerMissingFromSnapshot(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeRunner()
@@ -68,19 +79,19 @@ func TestSweepForgetsPeerMissingFromSnapshot(t *testing.T) {
 	seedUsagePeer(t, m, Peer{PublicKey: "P", PresharedKey: "p", Address: "10.10.0.2/32"})
 
 	f.outputs["awg show awg-rb0 transfer"] = "P\t500\t500\n"
-	m.SweepExpired(ctx)
+	m.SweepExpired(ctx) // primes the reference at 500/500
 
 	f.outputs["awg show awg-rb0 transfer"] = "" // gone from the interface
 	m.SweepExpired(ctx)
-	if got, _ := m.store.Get("P"); got.UsedRx != 500 || got.UsedTx != 500 {
+	if got, _ := m.store.Get("P"); got.UsedRx != 0 || got.UsedTx != 0 {
 		t.Fatalf("an absent peer must contribute no delta: used = %d/%d", got.UsedRx, got.UsedTx)
 	}
 
-	// Back with a fresh counter: the full value counts, not "700 minus 500".
-	f.outputs["awg show awg-rb0 transfer"] = "P\t7\t7\n"
+	// Back on a fresh counter that has already passed the forgotten reference.
+	f.outputs["awg show awg-rb0 transfer"] = "P\t600\t600\n"
 	m.SweepExpired(ctx)
-	if got, _ := m.store.Get("P"); got.UsedRx != 507 || got.UsedTx != 507 {
-		t.Fatalf("re-admitted peer must count from its fresh counter: used = %d/%d, want 507/507", got.UsedRx, got.UsedTx)
+	if got, _ := m.store.Get("P"); got.UsedRx != 600 || got.UsedTx != 600 {
+		t.Fatalf("a returning peer must count its whole fresh counter: used = %d/%d, want 600/600 (100/100 means the stale reference was kept)", got.UsedRx, got.UsedTx)
 	}
 }
 
@@ -94,21 +105,91 @@ func TestSweepDoesNotRewritePeersTomlWithoutChanges(t *testing.T) {
 	m.store.now = func() int64 { return 2000 }
 	seedUsagePeer(t, m, Peer{PublicKey: "P", PresharedKey: "p", Address: "10.10.0.2/32"})
 
-	f.outputs["awg show awg-rb0 transfer"] = "P\t100\t50\n"
-	m.SweepExpired(ctx) // this one DOES change the counters
-
 	path := m.store.GetPath()
 	old := time.Unix(1000000, 0)
+	mtime := func(t *testing.T) time.Time {
+		t.Helper()
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.ModTime()
+	}
+
+	// The priming tick counts nothing, so it must write nothing either.
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	f.outputs["awg show awg-rb0 transfer"] = "P\t100\t50\n"
+	m.SweepExpired(ctx)
+	if !mtime(t).Equal(old) {
+		t.Fatalf("peers.toml was rewritten on the priming tick (mtime %v)", mtime(t))
+	}
+
+	f.outputs["awg show awg-rb0 transfer"] = "P\t250\t80\n"
+	m.SweepExpired(ctx) // this one DOES change the counters
+	if mtime(t).Equal(old) {
+		t.Fatal("setup: a tick that moves the counters must write peers.toml")
+	}
+
 	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
 	m.SweepExpired(ctx) // same snapshot: nothing to add
-	st, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
+	if !mtime(t).Equal(old) {
+		t.Fatalf("peers.toml was rewritten on a tick with no traffic (mtime %v)", mtime(t))
 	}
-	if !st.ModTime().Equal(old) {
-		t.Fatalf("peers.toml was rewritten on a tick with no traffic (mtime %v)", st.ModTime())
+}
+
+// Enforcement must survive a peers.toml that cannot be written: the counters are
+// what suspends a peer, and a read-only install would otherwise hand every client
+// an unlimited allowance. The numbers stay in memory and the disk catches up on
+// the next successful write; the failure is logged once, not every 30 seconds.
+func TestSweepKeepsCountersWhenPeersTomlCannotBeWritten(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx := context.Background()
+	f := newFakeRunner()
+	m := newTestManager(t, f)
+	seedConf(t, m)
+	m.store.now = func() int64 { return 2000 }
+	seedUsagePeer(t, m, Peer{PublicKey: "P", PresharedKey: "p", Address: "10.10.0.2/32", QuotaBytes: 100})
+	good := m.store.GetPath()
+	breakStore(t, m)
+
+	f.outputs["awg show awg-rb0 transfer"] = "P\t0\t0\n"
+	m.SweepExpired(ctx) // prime
+	f.outputs["awg show awg-rb0 transfer"] = "P\t60\t50\n"
+	m.SweepExpired(ctx)
+	f.outputs["awg show awg-rb0 transfer"] = "P\t70\t60\n"
+	m.SweepExpired(ctx)
+
+	got, _ := m.store.Get("P")
+	if got.UsedRx != 70 || got.UsedTx != 60 {
+		t.Fatalf("counters must advance in memory despite the failed writes: used = %d/%d, want 70/60", got.UsedRx, got.UsedTx)
+	}
+	if !got.Suspended(2000) {
+		t.Fatal("a peer over its quota must be out of service even when nothing can be persisted")
+	}
+	if n := strings.Count(buf.String(), "kept in memory only"); n != 1 {
+		t.Fatalf("the write failure must be reported once across the ticks, got %d:\n%s", n, buf.String())
+	}
+
+	// Recovery is worth exactly one line too: the operator has to learn that the
+	// numbers are on disk again.
+	m.store.path = good
+	f.outputs["awg show awg-rb0 transfer"] = "P\t90\t80\n"
+	m.SweepExpired(ctx)
+	if n := strings.Count(buf.String(), "writable again"); n != 1 {
+		t.Fatalf("recovery must be reported once, got %d:\n%s", n, buf.String())
+	}
+	if n := strings.Count(buf.String(), "kept in memory only"); n != 1 {
+		t.Fatalf("recovery must not re-report the failure, got %d:\n%s", n, buf.String())
+	}
+	if got, _ := m.store.Get("P"); got.UsedRx != 90 || got.UsedTx != 80 {
+		t.Fatalf("the recovered write must carry the whole running total: used = %d/%d, want 90/80", got.UsedRx, got.UsedTx)
 	}
 }
 
@@ -123,6 +204,11 @@ func TestSweepSuspendsPeerCrossingQuotaSameTick(t *testing.T) {
 	seedUsagePeer(t, m, Peer{PublicKey: "P", PresharedKey: "p", Address: "10.10.0.2/32", QuotaBytes: 100})
 	m.appendPeerToConf(PeerLine{Name: "x", PublicKey: "P", PSK: "p", AllowedIP: "10.10.0.2/32"})
 	f.outputs["awg show awg-rb0"] = "peer: P\n"
+	f.outputs["awg show awg-rb0 transfer"] = "P\t0\t0\n"
+	m.SweepExpired(ctx) // prime, nothing spent yet
+	if _, ok := m.store.Get("P"); !ok || f.sawContains("awg set awg-rb0 peer P remove") {
+		t.Fatalf("setup: nothing may be suspended before any traffic; calls=%v", f.calls)
+	}
 	f.outputs["awg show awg-rb0 transfer"] = "P\t60\t50\n" // 110 >= 100
 
 	m.SweepExpired(ctx)
@@ -312,15 +398,23 @@ func TestSingboxSweepAccountsPeerStats(t *testing.T) {
 		return map[string]PeerStat{"P": stat}, nil
 	})
 
+	// Same rule as on kernel: a sing-box endpoint survives a panel restart (the
+	// sync is change-gated), so the first snapshot is a reference, not a bill.
 	m.SweepExpired(ctx)
-	if got, _ := m.store.Get("P"); got.UsedRx != 100 || got.UsedTx != 40 {
-		t.Fatalf("first tick: used = %d/%d, want 100/40", got.UsedRx, got.UsedTx)
+	if got, _ := m.store.Get("P"); got.UsedRx != 0 || got.UsedTx != 0 {
+		t.Fatalf("the priming tick must not count anything: used = %d/%d, want 0/0", got.UsedRx, got.UsedTx)
 	}
 
-	stat = PeerStat{RxBytes: 30, TxBytes: 90} // endpoint restarted: rx counter reset
+	stat = PeerStat{RxBytes: 250, TxBytes: 140}
 	m.SweepExpired(ctx)
-	if got, _ := m.store.Get("P"); got.UsedRx != 130 || got.UsedTx != 90 {
-		t.Fatalf("second tick: used = %d/%d, want 130/90", got.UsedRx, got.UsedTx)
+	if got, _ := m.store.Get("P"); got.UsedRx != 150 || got.UsedTx != 100 {
+		t.Fatalf("second tick: used = %d/%d, want 150/100", got.UsedRx, got.UsedTx)
+	}
+
+	stat = PeerStat{RxBytes: 30, TxBytes: 90} // endpoint restarted: both counters reset
+	m.SweepExpired(ctx)
+	if got, _ := m.store.Get("P"); got.UsedRx != 180 || got.UsedTx != 190 {
+		t.Fatalf("after a counter reset: used = %d/%d, want 180/190", got.UsedRx, got.UsedTx)
 	}
 }
 
@@ -338,10 +432,13 @@ func TestSingboxSweepSuspendsQuotaExhaustedPeer(t *testing.T) {
 	if err := m.store.Put(p); err != nil {
 		t.Fatal(err)
 	}
+	stat := PeerStat{}
 	m.SetPeerStats(func() (map[string]PeerStat, error) {
-		return map[string]PeerStat{pub: {RxBytes: 80, TxBytes: 80}}, nil
+		return map[string]PeerStat{pub: stat}, nil
 	})
 
+	m.SweepExpired(ctx) // prime
+	stat = PeerStat{RxBytes: 80, TxBytes: 80}
 	m.SweepExpired(ctx)
 
 	if got, _ := m.store.Get(pub); got.UsedRx != 80 || got.UsedTx != 80 {
@@ -372,27 +469,41 @@ func TestSingboxSweepWithoutStatsRouteSkipsAccounting(t *testing.T) {
 }
 
 // The dedupe gate mirrors traffic.Sampler's: a route that stays broken logs once,
-// not every 30 seconds forever.
+// not every 30 seconds forever — and logs again once it breaks after a recovery,
+// or the second outage of the day would be silent.
 func TestSingboxSweepStatsErrorLogsOnce(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
 	ctx := context.Background()
 	m, _, _ := newSingboxMgr(t)
 	seedUsagePeer(t, m, Peer{PublicKey: "P", Address: "10.10.0.2/32"})
+	fail := true
 	m.SetPeerStats(func() (map[string]PeerStat, error) {
-		return nil, errors.New("connection refused")
+		if fail {
+			return nil, errors.New("connection refused")
+		}
+		return map[string]PeerStat{"P": {RxBytes: 1}}, nil
 	})
 
 	m.SweepExpired(ctx)
-	m.mu.Lock()
-	first := m.lastUsageStatsErr
-	m.mu.Unlock()
-	if first == "" {
-		t.Fatal("the first failure must be recorded so the second can be silenced")
-	}
 	m.SweepExpired(ctx)
+	if n := strings.Count(buf.String(), "connection refused"); n != 1 {
+		t.Fatalf("a standing failure must log once, got %d:\n%s", n, buf.String())
+	}
 	m.mu.Lock()
-	second := m.lastUsageStatsErr
+	gated := m.lastUsageStatsErr
 	m.mu.Unlock()
-	if second != first {
-		t.Fatalf("the gate must stay closed while the error is unchanged: %q -> %q", first, second)
+	if gated != "connection refused" {
+		t.Fatalf("gate holds %q, want the recorded error", gated)
+	}
+
+	fail = false
+	m.SweepExpired(ctx) // recovery re-arms the gate
+	fail = true
+	m.SweepExpired(ctx)
+	if n := strings.Count(buf.String(), "connection refused"); n != 2 {
+		t.Fatalf("a failure after a recovery must log again, got %d occurrences:\n%s", n, buf.String())
 	}
 }
