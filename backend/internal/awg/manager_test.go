@@ -586,7 +586,7 @@ func TestListPeersKernel_FailedShowIsNotZero(t *testing.T) {
 		t.Helper()
 		m := newTestManager(t, f)
 		m.backend = "kernel"
-		if err := m.store.Put(Peer{PublicKey: "K1", PrivateKey: "p", Address: "10.10.0.2/32", Name: "alice"}); err != nil {
+		if err := m.store.Put(Peer{PublicKey: "K1", PrivateKey: "p", Address: "10.10.0.2/32", Name: "alice", UsedRx: 7, UsedTx: 9}); err != nil {
 			t.Fatal(err)
 		}
 		return m
@@ -600,8 +600,10 @@ func TestListPeersKernel_FailedShowIsNotZero(t *testing.T) {
 		if p.Stats != PeerStatsLive || p.StatsReason != PeerStatsReasonNone {
 			t.Fatalf("%q/%q, want live with no reason", p.Stats, p.StatsReason)
 		}
-		if p.Rx != 10 || p.Tx != 20 {
-			t.Errorf("rx/tx = %d/%d, want 10/20", p.Rx, p.Tx)
+		// The row's bytes are the STORED cumulative counters, not the live ones
+		// `awg show transfer` just reported: the sweep folds those into these.
+		if p.Rx != 7 || p.Tx != 9 {
+			t.Errorf("rx/tx = %d/%d, want the stored 7/9", p.Rx, p.Tx)
 		}
 	})
 

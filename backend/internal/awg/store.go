@@ -195,6 +195,46 @@ func (s *Store) Put(p Peer) error {
 	return nil
 }
 
+// AddUsage folds per-peer byte deltas into the cumulative UsedRx/UsedTx counters
+// in ONE atomic write, and writes nothing at all when every delta is zero.
+//
+// One write, not a Put per peer, because this runs every 30s forever on a router
+// whose peers.toml sits on flash: a box with twenty busy peers would otherwise
+// rewrite the whole file twenty times a tick. Not writing an unchanged file is
+// the same economy taken to its limit — a quiet server must not touch the disk.
+//
+// Deltas are already reset-corrected by the caller (see Manager.accountUsageLocked);
+// this only adds. Keys the store does not know are ignored: a peer deleted
+// between the snapshot and here is gone, not resurrected.
+func (s *Store) AddUsage(deltas map[string]peerXfer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev := map[string]Peer{}
+	for pk, d := range deltas {
+		if d.rx == 0 && d.tx == 0 {
+			continue
+		}
+		p, ok := s.byPK[pk]
+		if !ok {
+			continue
+		}
+		prev[pk] = *p
+		p.UsedRx += d.rx
+		p.UsedTx += d.tx
+	}
+	if len(prev) == 0 {
+		return nil // nothing moved: leave the file alone
+	}
+	if err := s.saveLocked(); err != nil {
+		for pk := range prev {
+			restored := prev[pk]
+			s.byPK[pk] = &restored
+		}
+		return err
+	}
+	return nil
+}
+
 // Replace swaps the whole store for a backup's content and persists; on save
 // failure the previous content stays. Callers validate before calling.
 func (s *Store) Replace(serverKey, headerKey, ulaPrefix string, peers []Peer) error {

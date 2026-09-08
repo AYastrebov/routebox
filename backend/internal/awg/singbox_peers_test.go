@@ -28,6 +28,15 @@ func TestListPeersSingbox_PeerStatsTakePriorityOverLiveness(t *testing.T) {
 	// The traffic fallback would say "stale" — peerStatsFn must win when both are wired.
 	m.SetPeerLiveness(livenessOf(map[string]int64{tunnelIP(sum.Address): stale}))
 
+	// The UAPI byte counters feed the SWEEP (they are what the stored cumulative
+	// ones are topped up from), not the row: seed the store so the row has its
+	// own numbers to show and the two cannot be confused.
+	p, _ := m.store.Get(sum.PublicKey)
+	p.UsedRx, p.UsedTx = 2000, 1000
+	if err := m.store.Put(p); err != nil {
+		t.Fatal(err)
+	}
+
 	peers := m.ListPeers(context.Background())
 	if len(peers) != 1 {
 		t.Fatalf("ListPeers = %+v, want the one peer", peers)
@@ -35,8 +44,8 @@ func TestListPeersSingbox_PeerStatsTakePriorityOverLiveness(t *testing.T) {
 	if !peers[0].Online || peers[0].LastHandshake != real {
 		t.Errorf("peer = %+v, want online with the real UAPI handshake %d", peers[0], real)
 	}
-	if peers[0].Tx != 100 || peers[0].Rx != 200 {
-		t.Errorf("peer tx/rx = %d/%d, want 100/200 from the UAPI stats", peers[0].Tx, peers[0].Rx)
+	if peers[0].Tx != 1000 || peers[0].Rx != 2000 {
+		t.Errorf("peer tx/rx = %d/%d, want the stored 1000/2000", peers[0].Tx, peers[0].Rx)
 	}
 }
 
@@ -56,7 +65,7 @@ func TestListPeersSingbox_UnsupportedStatsFallsBackToLiveness(t *testing.T) {
 		t.Errorf("peer = %+v, want the traffic-liveness fallback to have applied", peers[0])
 	}
 	if peers[0].Tx != 0 || peers[0].Rx != 0 {
-		t.Errorf("peer tx/rx = %d/%d, want 0/0 — the traffic fallback has no per-peer counters", peers[0].Tx, peers[0].Rx)
+		t.Errorf("peer tx/rx = %d/%d, want 0/0 — nothing has been accounted to this peer yet", peers[0].Tx, peers[0].Rx)
 	}
 }
 

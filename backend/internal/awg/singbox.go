@@ -630,15 +630,12 @@ func (m *Manager) statusSingbox(ctx context.Context) AWGStatus {
 	if phase == "" {
 		phase = PhaseIdle
 	}
-	peers := m.listPeersSingbox()
+	peers, rx, tx := m.listPeersSingboxLive()
 	online := 0
-	var rx, tx int64
 	for _, p := range peers {
 		if p.Online {
 			online++
 		}
-		rx += p.Rx
-		tx += p.Tx
 	}
 	// ConfigDirty mirrors the kernel Status: enabled AND the saved settings differ
 	// from the running snapshot on any field that needs a re-apply — subnet, port,

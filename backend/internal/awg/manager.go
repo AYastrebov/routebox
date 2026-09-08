@@ -17,31 +17,46 @@ import (
 
 	"routebox/backend/internal/awg/cps"
 	"routebox/backend/internal/config"
+	"routebox/backend/internal/quota"
 	"routebox/backend/internal/util"
 )
 
 // PeerSummary is the secret-free API/UI view of a peer.
 //
-// On kernel, the liveness pair and Rx/Tx come from a real handshake and
-// interface counters (awg show). On singbox they come from the WireGuard
-// device's own UAPI state via peerStatsFn — a real handshake too, just
-// reached over the Clash API instead of a kernel interface — falling back to
-// livenessFn's traffic-derived approximation (see listPeersSingbox) only on
-// an amnezia-box binary that predates that route.
+// On kernel, the liveness pair comes from a real handshake off the interface
+// (awg show). On singbox it comes from the WireGuard device's own UAPI state
+// via peerStatsFn — a real handshake too, just reached over the Clash API
+// instead of a kernel interface — falling back to livenessFn's traffic-derived
+// approximation (see listPeersSingbox) only on an amnezia-box binary that
+// predates that route.
+//
+// Rx/Tx are NOT those live counters: they are the peer's stored cumulative
+// totals, which the sweep tops up with the live deltas (see accountUsageLocked).
+// The live ones restart from zero whenever the interface or the endpoint does,
+// and a quota bar drawn from them would hand the peer its allowance back on
+// every reboot.
 type PeerSummary struct {
 	Name          string `json:"name"`
 	PublicKey     string `json:"public_key"`
 	Address       string `json:"address"`
 	LastHandshake int64  `json:"last_handshake"` // unix seconds; 0 = never seen
 	Online        bool   `json:"online"`         // last seen within onlineWindowSec
-	Rx            int64  `json:"rx"`             // cumulative bytes received (since iface up)
-	Tx            int64  `json:"tx"`             // cumulative bytes sent (since iface up)
+	Rx            int64  `json:"rx"`             // Peer.UsedRx: cumulative bytes received since the last reset
+	Tx            int64  `json:"tx"`             // Peer.UsedTx: cumulative bytes sent since the last reset
 	ExpiresAt     int64  `json:"expires_at"`     // unix sec; 0 = never expires
+	QuotaBytes    int64  `json:"quota_bytes"`    // limit on rx+tx; 0 = no limit
+	UsedResetAt   int64  `json:"used_reset_at"`  // unix sec the counters were last zeroed; 0 = never
+	// SuspendReason is why the peer is out of service ("quota"/"expired"), empty
+	// when it is in service. Derived from the same Peer.Suspension the renderers
+	// and the sweep use, so the roster can never disagree with what is served.
+	SuspendReason quota.Reason `json:"suspend_reason"`
 
-	// Stats says how much of the above was actually measured (#75). Without it a
-	// peer whose numbers could not be read is indistinguishable from one that
-	// really never connected and moved no bytes — which is what the roster showed,
-	// as fact, on every binary predating the per-peer UAPI route.
+	// Stats says how much of the LIVE reading behind this row was actually
+	// measured (#75) — the handshake pair, and the snapshot the sweep folds into
+	// the counters above. Without it a peer whose numbers could not be read is
+	// indistinguishable from one that really never connected and moved no bytes —
+	// which is what the roster showed, as fact, on every binary predating the
+	// per-peer UAPI route.
 	//
 	// omitempty because AddPeer returns a summary before any of this is known,
 	// and an empty string is not one of the values the panel's type allows.
@@ -172,6 +187,20 @@ type Manager struct {
 	// seconds, and a persistent failure (secret rotated, amnezia-box down)
 	// must log once, not once per poll. Touched only under mu.
 	lastPeerStatsErr string
+
+	// lastUsageStatsErr is the same gate for the SWEEP's own fetch, kept apart
+	// from lastPeerStatsErr because the two callers fail for different reasons
+	// and say different things: a roster poll degrades a display, a missed sweep
+	// fetch means nobody's quota moved for 30 seconds. Sharing one gate would let
+	// a roster poll swallow the sweep's first report. Touched only under mu.
+	lastUsageStatsErr string
+
+	// lastXfer is the previous LIVE byte snapshot per public key, the reference
+	// the sweep diffs against to top up Peer.UsedRx/UsedTx. It lives in memory
+	// only, so the first tick after a restart has no reference and counts the
+	// whole current value (the interface may well have been up without us).
+	// Guarded by addMu, like everything else the sweep's accounting touches.
+	lastXfer map[string]peerXfer
 
 	// livenessFn answers "when did this tunnel IP last move bytes", and exists
 	// for the singbox backend as a fallback for amnezia-box binaries that
@@ -558,7 +587,11 @@ func (m *Manager) ListPeers(ctx context.Context) []PeerSummary {
 		return m.listPeersSingbox()
 	}
 	hs, hsOK := m.iface_Handshakes(ctx)
-	xf, xfOK := m.iface_Transfer(ctx)
+	// The transfer read is kept for its verdict alone: the row's byte counts now
+	// come from the store, but `awg show transfer` is the source the sweep folds
+	// into them, and a roster that cannot read it is a roster whose numbers have
+	// stopped moving.
+	_, xfOK := m.iface_Transfer(ctx)
 	// `awg show` failing — deleted interface, missing tool — leaves both maps
 	// empty, which is indistinguishable from a quiet server unless the rows say
 	// so. Marking them live here would restate the very lie #75 is about.
@@ -570,15 +603,25 @@ func (m *Manager) ListPeers(ctx context.Context) []PeerSummary {
 	out := []PeerSummary{}
 	for _, p := range m.store.List() {
 		ts := hs[p.PublicKey]
-		x := xf[p.PublicKey]
 		// The kernel path reads `awg show` off a real interface: always measured.
-		out = append(out, PeerSummary{
-			Name: p.Name, PublicKey: p.PublicKey, Address: p.Address,
-			LastHandshake: ts, Online: isOnline(ts, now), Rx: x.rx, Tx: x.tx,
-			ExpiresAt: p.ExpiresAt, Stats: kernelKind, StatsReason: kernelWhy,
-		})
+		out = append(out, peerSummaryFor(p, ts, now, kernelKind, kernelWhy))
 	}
 	return out
+}
+
+// peerSummaryFor assembles one roster row: liveness from whatever the backend
+// could read, everything else from the store. Both backends go through it so a
+// field added to PeerSummary cannot reach one roster and not the other — which
+// is how the kernel path once shipped a quota bar the singbox path did not.
+func peerSummaryFor(p Peer, lastHandshake, now int64, kind PeerStatsKind, why PeerStatsReason) PeerSummary {
+	return PeerSummary{
+		Name: p.Name, PublicKey: p.PublicKey, Address: p.Address,
+		LastHandshake: lastHandshake, Online: isOnline(lastHandshake, now),
+		Rx: p.UsedRx, Tx: p.UsedTx,
+		ExpiresAt: p.ExpiresAt, QuotaBytes: p.QuotaBytes, UsedResetAt: p.UsedResetAt,
+		SuspendReason: p.Suspension(now),
+		Stats:         kind, StatsReason: why,
+	}
 }
 
 // listPeersSingbox fills the roster's liveness from the WireGuard device's
@@ -599,6 +642,17 @@ func (m *Manager) ListPeers(ctx context.Context) []PeerSummary {
 // after onlineWindowSec, where a real handshake would keep rekeying — used
 // only when peerStatsFn is unset or reports ErrAwgPeerStatsUnsupported.
 func (m *Manager) listPeersSingbox() []PeerSummary {
+	peers, _, _ := m.listPeersSingboxLive()
+	return peers
+}
+
+// listPeersSingboxLive is listPeersSingbox plus the LIVE byte totals of the same
+// fetch, for statusSingbox. The roster's own rx/tx are the stored cumulative
+// counters now, but AWGStatus.Rx/Tx mean "moved since the server came up" on the
+// kernel backend (it sums `awg show transfer`), and one number under one name has
+// to mean one thing. Returned from here rather than fetched again so the strip
+// and the roster still come from a single call.
+func (m *Manager) listPeersSingboxLive() (peers []PeerSummary, liveRx, liveTx int64) {
 	m.mu.Lock()
 	statsFn, liveFn := m.peerStatsFn, m.livenessFn
 	lastErr := m.lastPeerStatsErr
@@ -642,22 +696,22 @@ func (m *Manager) listPeersSingbox() []PeerSummary {
 
 	out := []PeerSummary{}
 	for _, p := range m.store.List() {
-		var ts, rx, tx int64
+		var ts int64
 		// A peer the device has but no stats for is a peer that has not handshaked
 		// yet — that IS "never connected", and reporting it as unknown would be
 		// its own lie. Only the whole-fetch failure above makes the row unknown.
 		if stat, ok := stats[p.PublicKey]; ok {
-			ts, rx, tx = stat.LastHandshake, stat.RxBytes, stat.TxBytes
+			ts = stat.LastHandshake
 		} else if stats == nil {
 			ts = seen[tunnelIP(p.Address)]
 		}
-		out = append(out, PeerSummary{
-			Name: p.Name, PublicKey: p.PublicKey, Address: p.Address,
-			LastHandshake: ts, Online: isOnline(ts, now), Rx: rx, Tx: tx,
-			ExpiresAt: p.ExpiresAt, Stats: kind, StatsReason: why,
-		})
+		out = append(out, peerSummaryFor(p, ts, now, kind, why))
 	}
-	return out
+	for _, stat := range stats {
+		liveRx += stat.RxBytes
+		liveTx += stat.TxBytes
+	}
+	return out, liveRx, liveTx
 }
 
 // PeerConfig reports whether a stored secret exists for pub (existence check the
@@ -917,17 +971,37 @@ func (m *Manager) RemovePeer(ctx context.Context, pub string) (string, error) {
 	return addr, nil
 }
 
-// RenewPeer sets a peer's ExpiresAt and ensures it is admitted to the live
-// interface + conf. expiresAt is 0 (never) or a future unix ts (the handler
-// validates); admit is idempotent, so this is safe whether the peer was suspended
-// or already live. ErrPeerNotFound if unknown.
+// RenewPeer sets a peer's ExpiresAt, leaving its traffic limit as it is. Kept as
+// a thin wrapper over SetPeerLimits so the existing expiry handler keeps working
+// while the quota field is being wired through the API.
 //
-// A peer suspended for a REASON THIS DOES NOT LIFT — a used-up traffic quota — is
-// not admitted: the date is stored, but the peer stays off the interface, exactly
-// where the sweep left it, until the quota is raised or the counter reset. Expiry
-// and quota are independent tools (spec Q16), so clearing one must not silently
-// clear the other.
+// The quota read here is outside addMu, so a limit change landing in the same
+// instant could be written back unchanged. Harmless for the one caller left (the
+// expiry endpoint, driven by a human), and gone the moment that endpoint passes
+// both limits through SetPeerLimits itself.
 func (m *Manager) RenewPeer(ctx context.Context, pub string, expiresAt int64) error {
+	quotaBytes := int64(0)
+	if p, ok := m.store.Get(pub); ok {
+		quotaBytes = p.QuotaBytes
+	}
+	return m.SetPeerLimits(ctx, pub, expiresAt, quotaBytes)
+}
+
+// SetPeerLimits writes BOTH of a peer's limits — the expiry date and the traffic
+// quota — and immediately brings the interface in line with the verdict they
+// produce. expiresAt is 0 (never) or a unix ts, quotaBytes 0 (no limit) or a byte
+// count; the handler validates. ErrPeerNotFound if unknown.
+//
+// The two are independent tools (spec Q16), which is why they are written
+// together rather than by two endpoints that would each have to guess the other's
+// value: a peer suspended on quota does not come back because its date moved, and
+// a peer suspended on date does not come back because its limit was raised.
+//
+// Both are applied at save time, not at the next tick (spec Q19/Q20): raising a
+// limit or extending a date re-admits a peer that has nothing else holding it
+// back, and lowering a limit below what is already spent takes it off now. A tick
+// would do the suspend side eventually and the admit side never.
+func (m *Manager) SetPeerLimits(ctx context.Context, pub string, expiresAt int64, quotaBytes int64) error {
 	if _, err := ValidatePublicKey(pub); err != nil {
 		return err
 	}
@@ -938,42 +1012,203 @@ func (m *Manager) RenewPeer(ctx context.Context, pub string, expiresAt int64) er
 		return ErrPeerNotFound
 	}
 	prev := p
-	p.ExpiresAt = expiresAt
+	p.ExpiresAt, p.QuotaBytes = expiresAt, quotaBytes
 	if err := m.store.Put(p); err != nil {
 		return err
 	}
+	return m.applySuspensionChange(ctx, prev, p)
+}
+
+// ResetPeerUsage zeroes a peer's cumulative counters and stamps the moment, then
+// re-admits it if that is all that was holding it back (spec Q9/Q19). The limit
+// itself is untouched: "reset the counter" and "change the allowance" are two
+// different decisions, and a reset that also cleared the quota would leave the
+// operator no way to say "start this month over".
+//
+// Nothing else about the peer changes, in particular not the sweep's reference
+// snapshot: the live counters kept running, and the next tick's delta is still
+// the traffic since the tick before, not since the reset.
+func (m *Manager) ResetPeerUsage(ctx context.Context, pub string) error {
+	if _, err := ValidatePublicKey(pub); err != nil {
+		return err
+	}
+	m.addMu.Lock()
+	defer m.addMu.Unlock()
+	p, ok := m.store.Get(pub)
+	if !ok {
+		return ErrPeerNotFound
+	}
+	prev := p
+	p.UsedRx, p.UsedTx, p.UsedResetAt = 0, 0, m.store.now()
+	if err := m.store.Put(p); err != nil {
+		return err
+	}
+	return m.applySuspensionChange(ctx, prev, p)
+}
+
+// applySuspensionChange makes the served state match a peer whose limits or
+// counters have just been written: admit it if it is in service, suspend it if
+// the write is what put it out of service. Caller holds m.addMu and has already
+// persisted next; prev is what the store held before, for the rollback.
+//
+// On singbox the endpoint is rendered from the store, so one sync covers both
+// directions. On kernel:
+//
+//   - in service → admit, unconditionally. It is idempotent, and running it on a
+//     peer that was already live is what repairs one that quietly fell off the
+//     interface (a crash, a manual `awg set`) — the sweep only ever removes.
+//   - newly out of service → suspend. A peer that was ALREADY suspended is left
+//     alone: it is off the interface, and a second removal would only turn a
+//     stored-quota edit into a live `awg set … remove` for no reason.
+//
+// A failed admit rolls the store back, because nothing heals a store that claims
+// limits the interface never got. A failed suspend does not: the peer is stored
+// as out of service and live, which is exactly the state the next sweep fixes,
+// and putting the old limits back would instead throw the operator's change away.
+func (m *Manager) applySuspensionChange(ctx context.Context, prev, next Peer) error {
+	pub := next.PublicKey
 	if m.backendIs("singbox") {
 		if err := m.singboxSync(); err != nil {
-			// The endpoint kept the old expiry, so the store must too — otherwise
-			// the panel shows a renewal that never reached sing-box.
+			// The endpoint kept the old limits, so the store must too — otherwise
+			// the panel shows a change that never reached sing-box.
 			if perr := m.store.Put(prev); perr != nil {
-				log.Printf("awg: peer %s expiry could not be synced, and restoring the old value failed: %v (sync: %v)", pub, perr, err)
+				log.Printf("awg: peer %s limits could not be synced, and restoring the old values failed: %v (sync: %v)", pub, perr, err)
 			}
 			return err
 		}
 		return nil
 	}
-	if p.Suspended(m.store.now()) {
-		return nil // still out of service on quota; the store now holds the new date
+	now := m.store.now()
+	if next.Suspended(now) {
+		if prev.Suspended(now) {
+			return nil // already off the interface; the store now holds the new values
+		}
+		if err := m.suspend(ctx, pub); err != nil {
+			log.Printf("awg: peer %s is out of service (%s) but could not be removed from %s: %v", pub, next.Suspension(now), m.iface, err)
+			return err
+		}
+		return nil
 	}
-	if err := m.admit(ctx, p); err != nil {
-		// Mirror of the singbox branch above. admit rolls its own changes back,
-		// so the interface and the .conf still carry the old expiry — and the
-		// store must too, or the panel shows a renewal the peer never got. The
-		// sweep cannot heal this: it only suspends peers whose expiry has passed.
+	if err := m.admit(ctx, next); err != nil {
+		// admit rolls its own changes back, so the interface and the .conf still
+		// carry the old limits — and the store must too, or the panel shows a
+		// renewal the peer never got. The sweep cannot heal this: it only
+		// suspends, never admits.
 		if perr := m.store.Put(prev); perr != nil {
-			log.Printf("awg: peer %s could not be re-admitted, and restoring its old expiry failed: %v (admit: %v)", pub, perr, err)
+			log.Printf("awg: peer %s could not be re-admitted, and restoring its old limits failed: %v (admit: %v)", pub, perr, err)
 		}
 		return err
 	}
 	return nil
 }
 
+// accountUsageLocked folds one LIVE byte snapshot into the peers' stored
+// cumulative counters and persists them in a single write (none when nothing
+// moved). Caller holds m.addMu.
+//
+// The live counters are per-interface (kernel) or per-process (sing-box) and
+// restart from zero with them, so what is stored is a running total the snapshot
+// only ever ADDS to. Three rules, all of them about not inventing traffic
+// (spec Q7):
+//
+//   - cur < last: the counter was reset under us (interface restarted, endpoint
+//     re-created), so everything it now reports was moved since — the delta is
+//     the whole current value, not a negative number.
+//   - no last value: the first tick after a RouteBox restart. The interface may
+//     have been up the whole time without us, so the current value counts in
+//     full. It over-counts only what a previous process already recorded, and
+//     the alternative — starting the reference at the current value — silently
+//     forgives a peer everything it spent while the panel was down.
+//   - peer absent from the snapshot: no delta, and its reference is forgotten,
+//     so a re-admitted peer counts from its fresh counter instead of being
+//     diffed against a stale high-water mark it will never reach again.
+func (m *Manager) accountUsageLocked(cur map[string]peerXfer) {
+	if m.lastXfer == nil {
+		m.lastXfer = map[string]peerXfer{}
+	}
+	deltas := make(map[string]peerXfer, len(cur))
+	for pk, x := range cur {
+		last, seen := m.lastXfer[pk]
+		d := x
+		if seen {
+			if x.rx >= last.rx {
+				d.rx = x.rx - last.rx
+			}
+			if x.tx >= last.tx {
+				d.tx = x.tx - last.tx
+			}
+		}
+		m.lastXfer[pk] = x
+		deltas[pk] = d
+	}
+	for pk := range m.lastXfer {
+		if _, ok := cur[pk]; !ok {
+			delete(m.lastXfer, pk)
+		}
+	}
+	if err := m.store.AddUsage(deltas); err != nil {
+		// A read-only peers.toml is a standing condition reported elsewhere (see
+		// the sweep's singboxSync note); anything else is a counter that did not
+		// land, which means a quota that will not be enforced.
+		if !errors.Is(err, config.ErrReadOnly) {
+			log.Printf("awg: record peer usage: %v", err)
+		}
+	}
+}
+
+// usageSnapshotSingbox reads the fork's per-peer stats route — the same call
+// listPeersSingbox uses — as a byte snapshot for accounting. ok is false when
+// nothing could be read: no route on this binary, no answer, or nothing wired.
+// There is deliberately no second source (spec Q11): the SQLite traffic history
+// counts bytes crossing the box, not bytes inside a tunnel, and charging a peer
+// from it would be a different number wearing the same label.
+func (m *Manager) usageSnapshotSingbox() (map[string]peerXfer, bool) {
+	m.mu.Lock()
+	statsFn := m.peerStatsFn
+	lastErr := m.lastUsageStatsErr
+	m.mu.Unlock()
+	if statsFn == nil {
+		return nil, false
+	}
+	stats, err := statsFn()
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	if errText != lastErr {
+		if err != nil {
+			// Dedupe like traffic.Sampler's own gate: a route that stays missing
+			// (an amnezia-box predating it) or a proxy that stays down would
+			// otherwise log every 30 seconds forever.
+			log.Printf("awg: peer usage not accounted, per-peer stats unavailable: %v", err)
+		}
+		m.mu.Lock()
+		m.lastUsageStatsErr = errText
+		m.mu.Unlock()
+	}
+	if err != nil {
+		return nil, false
+	}
+	out := make(map[string]peerXfer, len(stats))
+	for pk, s := range stats {
+		out[pk] = peerXfer{rx: s.RxBytes, tx: s.TxBytes}
+	}
+	return out, true
+}
+
 // SweepExpired reconciles the live interface with the store, in both directions:
-// it suspends every peer Peer.Suspended calls out — expiry passed, or traffic
-// quota used up — keeping its store secret for later renewal, and strips every
-// peer that is ours nowhere. Idempotent, and a no-op when the interface is down
-// (iface_ShowPeers errors → return). Run by the sweep ticker.
+// it tops up every peer's byte counters from the live snapshot, suspends every
+// peer Peer.Suspended then calls out — expiry passed, or traffic quota used up —
+// keeping its store secret for later renewal, and strips every peer that is ours
+// nowhere. Idempotent, and a no-op when the interface is down (iface_ShowPeers
+// errors → return). Run by the sweep ticker.
+//
+// The accounting runs BEFORE the suspension pass and inside the same addMu
+// section, for two separate reasons. Before, so a peer that crosses its limit
+// comes off the interface on the tick that notices rather than 30s later. Under
+// the lock, because Store.Put replaces a peer whole: a renewal landing between
+// this snapshot and its write would be read, overwritten and silently lost —
+// which is the one failure this package has no way to heal.
 //
 // It costs one `awg show` per tick even when nothing is expired — the earlier
 // early-out on an empty expiry set is what left the foreign-peer pass running
@@ -1004,6 +1239,14 @@ func (m *Manager) SweepExpired(ctx context.Context) {
 
 		m.addMu.Lock()
 		defer m.addMu.Unlock()
+		// Byte accounting first: singboxSync renders the endpoint from the store,
+		// so folding the deltas in here means the same sync that runs below also
+		// drops whoever just ran out. The fetch is a 5s-capped loopback call and
+		// it is made under addMu on purpose — snapshot, deltas and store write
+		// have to be one critical section or a concurrent quota change is lost.
+		if cur, ok := m.usageSnapshotSingbox(); ok {
+			m.accountUsageLocked(cur)
+		}
 		// The probe result is a state commit ahead of a write, so it follows the
 		// same rule as the rest of the package: snapshot, commit, and put the
 		// snapshot back if the write does not land (see the commit rule above).
@@ -1057,11 +1300,17 @@ func (m *Manager) SweepExpired(ctx context.Context) {
 	if err != nil {
 		return // interface down / not enabled — nothing to enforce now
 	}
+	// `awg show transfer` failing leaves the stored counters exactly where they
+	// were: flat is wrong by less than zeroed, and forgetting the references
+	// would make the next successful read count every byte a second time.
+	if cur, ok := m.iface_Transfer(ctx); ok {
+		m.accountUsageLocked(cur)
+	}
 	now := m.store.now()
-	suspended := map[string]bool{}
+	suspended := map[string]quota.Reason{}
 	for _, p := range m.store.List() {
-		if p.Suspended(now) {
-			suspended[p.PublicKey] = true
+		if r := p.Suspension(now); r != quota.ReasonNone {
+			suspended[p.PublicKey] = r
 		}
 	}
 	// The suspension map is built from a store snapshot taken under addMu, and
@@ -1070,11 +1319,14 @@ func (m *Manager) SweepExpired(ctx context.Context) {
 	// suspended anyway — off the interface with the store calling it active,
 	// which nothing heals.
 	for _, pub := range live {
-		if !suspended[pub] {
+		reason, ok := suspended[pub]
+		if !ok {
 			continue
 		}
 		if err := m.suspend(ctx, pub); err != nil {
-			log.Printf("awg: suspend expired peer %s: %v", pub, err)
+			// Name the reason: "expired" on a peer whose date is fine and whose
+			// quota ran out sends the operator to the wrong button.
+			log.Printf("awg: suspend peer %s (%s): %v", pub, reason, err)
 		}
 	}
 	// Same pass, other direction: peers on the interface that are ours nowhere.
