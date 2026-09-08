@@ -93,6 +93,38 @@ func TestRemovePeerKernelDoesNotReAdmitAnExpiredPeer(t *testing.T) {
 	}
 }
 
+// Same duty for the other reason a peer can be suspended. A peer that used up
+// its traffic quota is off the interface with its secret kept, exactly like an
+// expired one — re-admitting it out of a failed delete would hand a client that
+// has spent its allowance a working tunnel until the next sweep. This is the
+// test that pins the compensation on Peer.Suspended rather than on the expiry
+// expression it replaced: the expired case above passes either way.
+func TestRemovePeerKernelDoesNotReAdmitAQuotaExhaustedPeer(t *testing.T) {
+	f := newFakeRunner()
+	m := newTestManager(t, f)
+	seedConf(t, m)
+	m.store.now = func() int64 { return 2000 }
+	// No expiry at all: only the quota puts this peer out of service.
+	if err := m.store.Put(Peer{
+		PublicKey: validPub, PresharedKey: "p", Address: "10.10.0.2/32",
+		QuotaBytes: 1024, UsedRx: 2048,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	breakStore(t, m)
+
+	if _, err := m.RemovePeer(context.Background(), validPub); err == nil {
+		t.Fatal("RemovePeer must fail when the secret cannot be deleted")
+	}
+
+	if _, ok := m.store.Get(validPub); !ok {
+		t.Fatal("the failed delete must leave the secret in the store")
+	}
+	if f.sawContains(validPub + " preshared-key") {
+		t.Fatalf("a peer over its quota was put back into service; calls=%v", f.calls)
+	}
+}
+
 // Both writes failing is the one case with nowhere left to go. It must not be
 // silent: the peer is off the interface and the store still claims it.
 func TestRemovePeerKernelReportsAFailedCompensation(t *testing.T) {
