@@ -569,3 +569,26 @@ func TestSetPeerLimitsLoweringQuotaWithInterfaceDownIsNotAnError(t *testing.T) {
 		}
 	}
 }
+
+// Q11: no per-peer stats source at all means no accounting, and that must be
+// visible in the log — the counters simply stop moving otherwise, and with them
+// every quota. Once, through the same gate as a failing fetch.
+func TestSingboxSweepWithoutStatsSourceLogsOnce(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx := context.Background()
+	m, _, _ := newSingboxMgr(t)
+	seedUsagePeer(t, m, Peer{PublicKey: "P", Address: "10.10.0.2/32"})
+	// no SetPeerStats: the source was never wired
+
+	m.SweepExpired(ctx)
+	if n := strings.Count(buf.String(), "per-peer stats source not wired"); n != 1 {
+		t.Fatalf("a missing stats source must be reported once, got %d:\n%s", n, buf.String())
+	}
+	m.SweepExpired(ctx)
+	if n := strings.Count(buf.String(), "per-peer stats source not wired"); n != 1 {
+		t.Fatalf("the gate must not repeat it every tick, got %d:\n%s", n, buf.String())
+	}
+}

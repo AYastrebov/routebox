@@ -91,6 +91,9 @@ func TestSingbox_Enable_ReadOnlyConfigFailsWithACauseTheAPICanClassify(t *testin
 // while any other sync failure still has to be visible.
 func TestSingbox_Sweep_ReadOnlyIsQuietButOtherFailuresAreNot(t *testing.T) {
 	m, fs, _ := newSingboxMgr(t)
+	// A wired (empty) stats source: an unwired one is itself a reported failure
+	// now, and this test is about the read-only sync being the quiet one.
+	m.SetPeerStats(func() (map[string]PeerStat, error) { return map[string]PeerStat{}, nil })
 
 	roErr := errRO() // built before capture: the manager logs its own verdict once
 

@@ -1212,7 +1212,9 @@ func (m *Manager) accountUsageLocked(cur map[string]peerXfer) {
 
 // usageSnapshotSingbox reads the fork's per-peer stats route — the same call
 // listPeersSingbox uses — as a byte snapshot for accounting. ok is false when
-// nothing could be read: no route on this binary, no answer, or nothing wired.
+// nothing could be read: no route on this binary, no answer, or nothing wired —
+// and each of those says so in the log once (spec Q11: no accounting is never
+// silent).
 // There is deliberately no second source (spec Q11): the SQLite traffic history
 // counts bytes crossing the box, not bytes inside a tunnel, and charging a peer
 // from it would be a different number wearing the same label.
@@ -1222,6 +1224,17 @@ func (m *Manager) usageSnapshotSingbox() (map[string]peerXfer, bool) {
 	lastErr := m.lastUsageStatsErr
 	m.mu.Unlock()
 	if statsFn == nil {
+		// Absence of a source is a failure to account, not a quiet no-op (spec
+		// Q11): the counters silently stop moving and every quota stops being
+		// enforced. Said through the same gate as a broken fetch, so it is one
+		// line and not one every 30 seconds.
+		const notWired = "per-peer stats source not wired"
+		if lastErr != notWired {
+			log.Printf("awg: peer usage not accounted: %s", notWired)
+			m.mu.Lock()
+			m.lastUsageStatsErr = notWired
+			m.mu.Unlock()
+		}
 		return nil, false
 	}
 	stats, err := statsFn()
