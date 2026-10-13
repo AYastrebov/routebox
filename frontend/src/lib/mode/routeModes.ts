@@ -49,6 +49,7 @@ export const SECTIONS: Section[] = [
 	// Router-only
 	{ path: '/config/clients', modes: ROUTER_ONLY },
 	{ path: '/config/subscriptions', modes: ROUTER_ONLY },
+	{ path: '/monitor/traffic', modes: ROUTER_ONLY },
 	{ path: '/monitor/breakdown', modes: ROUTER_ONLY },
 	{ path: '/monitor/proxies', modes: ROUTER_ONLY },
 	{ path: '/monitor/route-inspector', modes: ROUTER_ONLY }

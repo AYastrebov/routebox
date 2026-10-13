@@ -44,6 +44,7 @@ describe('isPathAllowed — vps subtracts router-only', () => {
 	it('router-only paths are blocked in vps', () => {
 		expect(isPathAllowed('/config/clients', 'vps')).toBe(false);
 		expect(isPathAllowed('/config/subscriptions', 'vps')).toBe(false);
+		expect(isPathAllowed('/monitor/traffic', 'vps')).toBe(false);
 		expect(isPathAllowed('/monitor/breakdown', 'vps')).toBe(false);
 		expect(isPathAllowed('/monitor/proxies', 'vps')).toBe(false);
 		expect(isPathAllowed('/monitor/route-inspector', 'vps')).toBe(false);
@@ -51,6 +52,7 @@ describe('isPathAllowed — vps subtracts router-only', () => {
 	it('router-only paths are allowed in router', () => {
 		expect(isPathAllowed('/config/clients', 'router')).toBe(true);
 		expect(isPathAllowed('/monitor/breakdown', 'router')).toBe(true);
+		expect(isPathAllowed('/monitor/traffic', 'router')).toBe(true);
 	});
 	it('consumers monitor is in both modes', () => {
 		expect(isPathAllowed('/monitor/consumers', 'router')).toBe(true);
@@ -151,7 +153,8 @@ describe('single-mode classification (sidebar drift guard)', () => {
 			'/config/subscriptions',
 			'/monitor/breakdown',
 			'/monitor/proxies',
-			'/monitor/route-inspector'
+			'/monitor/route-inspector',
+			'/monitor/traffic'
 		]);
 	});
 
