@@ -118,7 +118,8 @@
 	const pctOfTotal = (x: number, total: number) => (total > 0 ? Math.round((x / total) * 100) : 0);
 	// Mirror graph: download above the axis, upload below it on its own scale —
 	// upload is a fraction of download and on one scale it lies flat on the
-	// axis. The scale labels at the right edge say the two halves differ.
+	// axis. No scale labels: readers took them for measurements (#110); the
+	// hover readout gives exact values.
 	const DH = 64;
 	const UH = 28;
 	let downMax = $derived(Math.max(1024, ...graphDown) * 1.15);
@@ -583,15 +584,8 @@
 								{/each}
 							</div>
 						</div>
-						<!-- The scale labels sit in their own rows above and below the plot,
-						     right-aligned, so no curve ever runs into them: the download scale
-						     alone on top, the upload scale sharing the legend row. The rows
-						     span the full width like the svgs, so the hover ratio is unchanged. -->
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div class="mt-3" onpointerdown={trackHover} onpointermove={trackHover} onpointerleave={() => (hoverRatio = null)}>
-							<!-- At zero traffic the scale is the 1024 floor, which would read as
-							     a measurement; the rows stay so the plot does not jump. -->
-							<div class="h-4 flex justify-end text-[10px] tabular-nums text-[var(--ctp-overlay1)]">{#if peak(graphDown) > 0}↓ {formatSpeed(downMax)}{/if}</div>
 							<svg viewBox="0 0 {GW} {DH}" preserveAspectRatio="none" class="block w-full h-[4.5rem] sm:h-20" aria-hidden="true">
 								<line x1="0" y1={DH / 2} x2={GW} y2={DH / 2} stroke="var(--ctp-surface2)" stroke-dasharray="3 4" vector-effect="non-scaling-stroke" />
 								{#if downPaths.line}
@@ -616,12 +610,10 @@
 									<line x1={x} y1="0" x2={x} y2={UH} stroke="var(--ctp-overlay0)" stroke-opacity="0.45" stroke-width="1" stroke-dasharray="3 3" vector-effect="non-scaling-stroke" />
 								{/if}
 							</svg>
-							<!-- One line, never wrapping: the legend on the left, the upload
-							     scale on the right. A wrapped legend made this column taller
+							<!-- One line, never wrapping: a wrapped legend made this column taller
 							     than the one beside it. -->
-							<div class="mt-1 h-5 flex items-center justify-between gap-3 whitespace-nowrap text-xs text-[var(--ctp-overlay1)]">
+							<div class="mt-1 h-5 flex items-center whitespace-nowrap text-xs text-[var(--ctp-overlay1)]">
 								<span class="truncate">↓ {trafficNote(graphDown)}</span>
-								<span class="shrink-0 text-[10px] tabular-nums">{#if peak(graphUp) > 0}↑ {formatSpeed(upMax)}{/if}</span>
 							</div>
 						</div>
 						<!-- One slot of fixed height: the hover pill replaces the period label
