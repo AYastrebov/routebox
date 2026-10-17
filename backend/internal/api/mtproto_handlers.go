@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"routebox/backend/internal/bootstrap"
 	"routebox/backend/internal/config"
 	"routebox/backend/internal/mtproto"
 	"routebox/backend/internal/settings"
@@ -509,6 +510,18 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 	// applied can be undone below.
 	previous := h.settings.Get().Mtproto
 
+	// A bootstrapped install's dest routes to the front by address, and with
+	// the re-plan switched off nothing would move it: the front would go to
+	// the new address while dest kept sending strangers to the old one, where
+	// nobody listens. Refused up front, before anything changes.
+	if listen, ok := body["web_listen"].(string); ok && listen != previous.WebListen &&
+		h.settings.Get().Server.Bootstrapped && bootstrap.ReplanDisabled() {
+		writeError(w, http.StatusConflict,
+			"web_listen cannot change while BOOTSTRAP_CADDYFILE_REPLAN is off: dest's Caddyfile would keep pointing at the old address. Edit the Caddyfile by hand and restart, or unset BOOTSTRAP_CADDYFILE_REPLAN")
+
+		return
+	}
+
 	if err := h.settings.Update(updates); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -536,8 +549,7 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 
 	// Also ahead of the disk write, for the same reason: a front that cannot
 	// move to the new address must not leave the settings naming it.
-	frontMoved, err := h.syncWebFront(previous)
-	if err != nil {
+	rollbackWeb := func() {
 		if rollback := h.settings.Update(map[string]any{
 			"mtproto.web_enabled":    previous.WebEnabled,
 			"mtproto.web_hostname":   previous.WebHostname,
@@ -546,10 +558,40 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 		}); rollback != nil {
 			log.Printf("mtproto: cannot roll back the web proxy settings: %v", rollback)
 		}
+	}
 
+	frontBefore := ""
+	if h.webFront != nil {
+		frontBefore = h.webFront.Listen()
+	}
+
+	frontMoved, err := h.syncWebFront(previous)
+	if err != nil {
+		rollbackWeb()
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return
+	}
+
+	// The Caddyfile of a bootstrapped install routes to the front by address,
+	// so a front that moved (or came back up) has to be followed by a re-plan
+	// before any of this is kept. One that fails puts the front back where
+	// dest still points and fails the PUT: answering 200 over a dest that
+	// sends strangers to a closed port is the outcome this exists to prevent.
+	if frontMoved && h.caddyReplan != nil {
+		if err := h.caddyReplan(); err != nil {
+			// Only a move is undone. A front that merely came back up on the
+			// address it always had is where dest already points, and taking
+			// it down again would help nobody.
+			if h.settings.Get().Mtproto.WebListen != previous.WebListen {
+				h.restoreWebFront(frontBefore)
+			}
+			rollbackWeb()
+			writeError(w, http.StatusInternalServerError,
+				fmt.Sprintf("the web front cannot move: dest's Caddyfile could not be re-planned to follow it: %v", err))
+
+			return
+		}
 	}
 
 	// Off a bootstrapped install the front's stub IS web_public_dir (what
@@ -567,19 +609,6 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// The Caddyfile of a bootstrapped install routes the WEB proxy's traffic to
-	// the front by address, so a moved front is unreachable until it is
-	// re-planned. Not fatal — the setting did take — but said, the way apply
-	// says a user list that did not reach dest.
-	var warning string
-
-	if frontMoved && h.settings.Get().Server.Bootstrapped && h.caddyReplan != nil {
-		if err := h.caddyReplan(); err != nil {
-			log.Printf("mtproto: cannot re-plan the Caddyfile after moving the web front: %v", err)
-			warning = fmt.Sprintf("the web front moved, but dest's Caddyfile still points at the old address: %v", err)
-		}
-	}
-
 	// A running proxy has to pick up the new listen address, masking domain,
 	// outbound or WEB keys; Reconfigure is a no-op on a stopped one. Not
 	// Rebuild: that reuses the config saved at Start, so none of these would
@@ -590,40 +619,7 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if warning == "" {
-		writeSuccess(w, h.settings.Get().Mtproto)
-
-		return
-	}
-
-	// The same {..., "warning"} shape apply answers with: the settings fields
-	// at the top level, so the page reads them exactly as it does without one.
-	data, err := settingsWithWarning(h.settings.Get().Mtproto, warning)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
-
-	writeSuccess(w, data)
-}
-
-// settingsWithWarning flattens the [mtproto] block into a map so a "warning"
-// key can ride next to its fields.
-func settingsWithWarning(s settings.MtprotoSettings, warning string) (map[string]any, error) {
-	raw, err := json.Marshal(s)
-	if err != nil {
-		return nil, err
-	}
-
-	var data map[string]any
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, err
-	}
-
-	data["warning"] = warning
-
-	return data, nil
+	writeSuccess(w, h.settings.Get().Mtproto)
 }
 
 // syncWebFront makes the loopback front match the web_* settings just
@@ -644,16 +640,22 @@ func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) 
 	all := h.settings.Get()
 	current := all.Mtproto
 	listenChanged := current.WebListen != previous.WebListen
+	// A front that should be up and is not — its bind failed at boot — is
+	// retried by any save, so the operator is not left restarting the whole
+	// server to get it back once the port is free.
+	down := h.webFront.Listen() == ""
 
 	if all.Server.Bootstrapped {
-		if !listenChanged {
+		if !listenChanged && !down {
 			return false, nil
 		}
 
 		if err := h.webFront.Rebind(current.WebListen); err != nil {
-			return false, fmt.Errorf("cannot move the web front: %w", err)
+			return false, fmt.Errorf("cannot move the web front to %s (mtproto.web_listen): %w", current.WebListen, err)
 		}
 
+		// A front back up on an unchanged address still needs the re-plan the
+		// failed boot skipped.
 		return true, nil
 	}
 
@@ -664,16 +666,34 @@ func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) 
 		}
 
 		return false, nil
-	case !previous.WebEnabled && current.WebEnabled,
-		listenChanged && h.webFront.Listen() != "":
+	case current.WebEnabled && (!previous.WebEnabled || listenChanged || down):
 		// Rebind starts a stopped front and is a no-op on the address it
-		// already serves, so both "switched on" and "moved" land here.
+		// already serves, so "switched on", "moved" and "came back" all land
+		// here.
 		if err := h.webFront.Rebind(current.WebListen); err != nil {
 			return false, fmt.Errorf("cannot start the web front on %s: %w", current.WebListen, err)
 		}
 	}
 
 	return false, nil
+}
+
+// restoreWebFront puts the front back on the address it had before a PUT
+// moved it — or stops it, if it was down — after the Caddyfile could not be
+// re-planned to follow. Logged, not returned: the PUT is already failing, and
+// the error the operator needs is the re-plan's.
+func (h *Handler) restoreWebFront(listen string) {
+	if listen == "" {
+		if err := h.webFront.Stop(); err != nil {
+			log.Printf("mtproto: cannot stop the web front after a failed re-plan: %v", err)
+		}
+
+		return
+	}
+
+	if err := h.webFront.Rebind(listen); err != nil {
+		log.Printf("mtproto: cannot move the web front back to %s after a failed re-plan: %v", listen, err)
+	}
 }
 
 // EnableMtproto starts the proxy and persists the flag. PROTECTED.

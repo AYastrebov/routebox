@@ -426,7 +426,12 @@ func TestSyncDestReplansBeforeNaive(t *testing.T) {
 	}
 }
 
-func TestUpdateWebListenOnABootstrappedInstallReplansCaddy(t *testing.T) {
+// bootstrappedWebInstall is the mtproto test handler on an install that came up
+// from the bootstrap plan, with a re-plan that records its calls and answers
+// with *replanErr.
+func bootstrappedWebInstall(t *testing.T) (*Handler, http.Handler, *int, *error) {
+	t.Helper()
+
 	h, r := newMtprotoTestHandler(t)
 
 	if err := h.settings.SetBootstrap("/panel-secret", "127.0.0.1:9443", "", 443); err != nil {
@@ -434,11 +439,20 @@ func TestUpdateWebListenOnABootstrappedInstallReplansCaddy(t *testing.T) {
 	}
 
 	calls := 0
+
+	var replanErr error
+
 	h.SetCaddyReplan(func() error {
 		calls++
 
-		return errors.New("dest says no")
+		return replanErr
 	})
+
+	return h, r, &calls, &replanErr
+}
+
+func TestUpdateWebListenOnABootstrappedInstallReplansCaddy(t *testing.T) {
+	h, r, calls, _ := bootstrappedWebInstall(t)
 
 	// The front serves the stub site here, so switching the WEB proxy off
 	// must leave it up and must not cost a re-plan.
@@ -447,29 +461,145 @@ func TestUpdateWebListenOnABootstrappedInstallReplansCaddy(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
 	}
 
-	if h.webFront.Listen() != running || calls != 0 {
-		t.Fatalf("front listen = %q (want %q), replans = %d (want 0)", h.webFront.Listen(), running, calls)
+	if h.webFront.Listen() != running || *calls != 0 {
+		t.Fatalf("front listen = %q (want %q), replans = %d (want 0)", h.webFront.Listen(), running, *calls)
 	}
 
 	addr := freeAddr(t)
 
 	rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"web_listen":"`+addr+`"}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 with a warning, body = %s", rec.Code, rec.Body)
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
 	}
 
 	var body struct {
 		WebListen string `json:"web_listen"`
-		Warning   string `json:"warning"`
 	}
 
 	decodeMtprotoData(t, rec, &body)
 
-	if calls != 1 || !strings.Contains(body.Warning, "dest says no") {
-		t.Errorf("replans = %d, warning = %q; want one re-plan and its error surfaced", calls, body.Warning)
+	if *calls != 1 {
+		t.Errorf("replans = %d, want one after the move", *calls)
 	}
 
 	if body.WebListen != addr || h.webFront.Listen() != addr {
 		t.Errorf("web_listen = %q, front = %q, want both %q", body.WebListen, h.webFront.Listen(), addr)
+	}
+}
+
+// A re-plan that fails after the front moved would leave dest pointing at the
+// port just closed. The move is undone and the PUT fails with the reason.
+func TestUpdateWebListenRollsBackWhenTheReplanFails(t *testing.T) {
+	h, r, calls, replanErr := bootstrappedWebInstall(t)
+	*replanErr = errors.New("dest says no")
+
+	running := h.webFront.Listen()
+	before := h.settings.Get().Mtproto.WebListen
+
+	rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"web_listen":"`+freeAddr(t)+`"}`)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "dest says no") {
+		t.Fatalf("status = %d, body = %s; want 500 carrying the re-plan error", rec.Code, rec.Body)
+	}
+
+	if *calls != 1 {
+		t.Errorf("replans = %d, want 1", *calls)
+	}
+
+	if h.webFront.Listen() != running {
+		t.Errorf("front = %q, want it back on %q, where dest still points", h.webFront.Listen(), running)
+	}
+
+	if got := h.settings.Get().Mtproto.WebListen; got != before {
+		t.Errorf("web_listen = %q, want it rolled back to %q", got, before)
+	}
+}
+
+// With the re-plan switched off nothing would move dest after the front, so
+// the move is refused before anything changes.
+func TestUpdateWebListenIsRefusedWhileTheReplanIsDisabled(t *testing.T) {
+	t.Setenv("BOOTSTRAP_CADDYFILE_REPLAN", "0")
+
+	h, r, calls, _ := bootstrappedWebInstall(t)
+
+	running := h.webFront.Listen()
+	before := h.settings.Get().Mtproto.WebListen
+
+	rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"web_listen":"`+freeAddr(t)+`"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "BOOTSTRAP_CADDYFILE_REPLAN") {
+		t.Fatalf("status = %d, body = %s; want 409 naming the env var", rec.Code, rec.Body)
+	}
+
+	if h.webFront.Listen() != running || h.settings.Get().Mtproto.WebListen != before || *calls != 0 {
+		t.Errorf("a refused PUT changed something: front %q (was %q), web_listen %q (was %q), replans %d",
+			h.webFront.Listen(), running, h.settings.Get().Mtproto.WebListen, before, *calls)
+	}
+
+	// The same value is not a move, and the rest of the settings stay editable.
+	same := `{"web_listen":"` + before + `","public_port":8443}`
+	if rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", same); rec.Code != http.StatusOK {
+		t.Errorf("an unchanged web_listen was refused: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A front whose bind failed at boot comes back on the next save, and on a
+// bootstrapped install that also runs the re-plan the boot skipped.
+func TestUpdateRetriesADownFrontOnABootstrappedInstall(t *testing.T) {
+	h, r, calls, _ := bootstrappedWebInstall(t)
+
+	addr := freeAddr(t)
+	if err := h.settings.Update(map[string]any{"mtproto.web_listen": addr}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.webFront.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"public_port":8443}`); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+
+	if h.webFront.Listen() != addr || *calls != 1 {
+		t.Errorf("front = %q (want %q), replans = %d (want 1)", h.webFront.Listen(), addr, *calls)
+	}
+}
+
+// Off a bootstrapped install the front exists for the WEB proxy: while it is
+// on, a save brings a down front back.
+func TestUpdateRetriesADownFrontWhileWebIsOn(t *testing.T) {
+	h, r := newMtprotoTestHandler(t)
+
+	addr := freeAddr(t)
+	if err := h.settings.Update(map[string]any{"mtproto.web_enabled": true, "mtproto.web_listen": addr}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.webFront.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"public_port":8443}`); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+
+	if h.webFront.Listen() != addr {
+		t.Errorf("front = %q, want it back on %q", h.webFront.Listen(), addr)
+	}
+
+	// And with WEB off it stays down: nothing there needs it.
+	if err := h.settings.Update(map[string]any{"mtproto.web_enabled": false}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.webFront.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"public_port":8444}`); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+
+	if h.webFront.Listen() != "" {
+		t.Errorf("front = %q, want it down while WEB is off", h.webFront.Listen())
 	}
 }
