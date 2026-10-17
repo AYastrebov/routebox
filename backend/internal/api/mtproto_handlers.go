@@ -15,6 +15,8 @@ import (
 
 	"routebox/backend/internal/config"
 	"routebox/backend/internal/mtproto"
+	"routebox/backend/internal/settings"
+	"routebox/backend/internal/webfront"
 )
 
 // mtprotoClientRow is one roster entry on the wire.
@@ -42,10 +44,33 @@ func (h *Handler) mtprotoReady(w http.ResponseWriter) bool {
 	return true
 }
 
-// mtprotoConfig builds the proxy config from the persisted settings, so Enable
-// and Rebuild always agree about what is being served.
-func (h *Handler) mtprotoConfig() mtproto.Config {
-	s := h.settings.Get().Mtproto
+// MtprotoConfig builds the proxy config from the current settings, so Enable,
+// a settings save and main.go's boot all agree about what is being served.
+//
+// The WEB half is filled only when the feature is on AND there is a hostname to
+// answer to: the handler refuses to build without one, and failing the whole
+// proxy over a half-configured optional feature would take Fake TLS down too.
+func (h *Handler) MtprotoConfig() mtproto.Config {
+	all := h.settings.Get()
+	s := all.Mtproto
+
+	var web *mtproto.WebConfig
+
+	if hostname := all.EffectiveWebHostname(); s.WebEnabled && hostname != "" {
+		// A bootstrapped install's front already serves the stub site to
+		// strangers; the WEB proxy has to show them the same one, or the
+		// answer would change the moment the feature is switched on.
+		stubDir := s.WebPublicDir
+		if all.Server.Bootstrapped {
+			stubDir = h.stubRoot
+		}
+
+		web = &mtproto.WebConfig{
+			Hostname:       hostname,
+			TrustedProxies: settings.ParseTrustedProxies(all.Security.TrustedProxies),
+			Public:         webfront.NewStub(stubDir),
+		}
+	}
 
 	return mtproto.Config{
 		Listen:             s.Listen,
@@ -55,6 +80,7 @@ func (h *Handler) mtprotoConfig() mtproto.Config {
 		PreferIP:           s.PreferIP,
 		DomainFrontingPort: uint(s.DomainFrontingPort),
 		SocksProxy:         mtproto.SocksProxyAddr(s.Outbound, s.SocksPort),
+		Web:                web,
 	}
 }
 
@@ -384,16 +410,33 @@ func (h *Handler) GetMtprotoStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, port := h.mtprotoPublic()
-	settings := h.settings.Get().Mtproto
+	all := h.settings.Get()
+	mt := all.Mtproto
+	status := h.mtproto.Status()
+	webHostname := all.EffectiveWebHostname()
 
 	writeSuccess(w, map[string]any{
-		"status":   h.mtproto.Status(),
-		"settings": settings,
+		"status":   status,
+		"settings": mt,
+		// The WEB proxy's resolved view: the hostname it actually answers to
+		// (the public host on a bootstrapped install, whatever web_hostname
+		// says), and whether the panel owns its front ("managed"), so the page
+		// can lock the hostname and listen fields when it does.
+		"web": map[string]any{
+			"enabled":        mt.WebEnabled,
+			"managed":        all.Server.Bootstrapped,
+			"hostname":       webHostname,
+			"listen":         mt.WebListen,
+			"public_dir":     mt.WebPublicDir,
+			"can_issue_link": mtproto.CanIssueWebLink(webHostname, mt.WebEnabled, status.Running),
+			"sessions":       status.Web.Sessions,
+			"streams":        status.Web.Streams,
+		},
 		// Resolved rather than raw, so the page can grey out the link actions
 		// without duplicating the fallback logic.
 		"public_host":    host,
 		"public_port":    port,
-		"can_issue_link": mtproto.CanIssueLink(settings.MaskingDomain, host),
+		"can_issue_link": mtproto.CanIssueLink(mt.MaskingDomain, host),
 		"read_only":      h.mtproto.Store().IsReadOnly(),
 		// The exit picker's options ride along rather than coming from their own
 		// endpoint: they are a handful of tags, and a separate fetch could show
@@ -422,6 +465,8 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 		"public_port": true, "concurrency": true, "idle_timeout_sec": true,
 		"prefer_ip": true, "domain_fronting_port": true,
 		"outbound": true, "socks_port": true,
+		"web_enabled": true, "web_hostname": true, "web_listen": true,
+		"web_public_dir": true,
 	}
 
 	updates := map[string]any{}
@@ -489,23 +534,137 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Also ahead of the disk write, for the same reason: a front that cannot
+	// move to the new address must not leave the settings naming it.
+	frontMoved, err := h.syncWebFront(previous)
+	if err != nil {
+		if rollback := h.settings.Update(map[string]any{
+			"mtproto.web_enabled":    previous.WebEnabled,
+			"mtproto.web_hostname":   previous.WebHostname,
+			"mtproto.web_listen":     previous.WebListen,
+			"mtproto.web_public_dir": previous.WebPublicDir,
+		}); rollback != nil {
+			log.Printf("mtproto: cannot roll back the web proxy settings: %v", rollback)
+		}
+
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
 	if err := h.settings.Save(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return
 	}
 
-	// A running proxy has to pick up the new listen address, masking domain or
-	// outbound; a stopped one has nothing to do.
-	if h.mtproto.Status().Running {
-		if err := h.mtproto.Rebuild(); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+	// The Caddyfile of a bootstrapped install routes the WEB proxy's traffic to
+	// the front by address, so a moved front is unreachable until it is
+	// re-planned. Not fatal — the setting did take — but said, the way apply
+	// says a user list that did not reach dest.
+	var warning string
 
-			return
+	if frontMoved && h.settings.Get().Server.Bootstrapped && h.caddyReplan != nil {
+		if err := h.caddyReplan(); err != nil {
+			log.Printf("mtproto: cannot re-plan the Caddyfile after moving the web front: %v", err)
+			warning = fmt.Sprintf("the web front moved, but dest's Caddyfile still points at the old address: %v", err)
 		}
 	}
 
-	writeSuccess(w, h.settings.Get().Mtproto)
+	// A running proxy has to pick up the new listen address, masking domain,
+	// outbound or WEB keys; Reconfigure is a no-op on a stopped one. Not
+	// Rebuild: that reuses the config saved at Start, so none of these would
+	// ever reach it.
+	if err := h.mtproto.Reconfigure(h.MtprotoConfig()); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	if warning == "" {
+		writeSuccess(w, h.settings.Get().Mtproto)
+
+		return
+	}
+
+	// The same {..., "warning"} shape apply answers with: the settings fields
+	// at the top level, so the page reads them exactly as it does without one.
+	data, err := settingsWithWarning(h.settings.Get().Mtproto, warning)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	writeSuccess(w, data)
+}
+
+// settingsWithWarning flattens the [mtproto] block into a map so a "warning"
+// key can ride next to its fields.
+func settingsWithWarning(s settings.MtprotoSettings, warning string) (map[string]any, error) {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil, err
+	}
+
+	data["warning"] = warning
+
+	return data, nil
+}
+
+// syncWebFront makes the loopback front match the web_* settings just
+// committed in memory, reporting whether a bootstrapped install's front moved
+// to a new address (the one case its Caddyfile has to follow).
+//
+// On a bootstrapped install the front is always on — it serves the stub site
+// whether or not the WEB proxy is — so only an address change touches it.
+// Elsewhere it exists for the WEB proxy alone: switched on, it is started (or
+// moved) onto web_listen; switched off, it is stopped. Rebind binds the new
+// address before letting go of the old one, so a failure here leaves the
+// previous listener serving.
+func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) {
+	if h.webFront == nil {
+		return false, nil
+	}
+
+	all := h.settings.Get()
+	current := all.Mtproto
+	listenChanged := current.WebListen != previous.WebListen
+
+	if all.Server.Bootstrapped {
+		if !listenChanged {
+			return false, nil
+		}
+
+		if err := h.webFront.Rebind(current.WebListen); err != nil {
+			return false, fmt.Errorf("cannot move the web front: %w", err)
+		}
+
+		return true, nil
+	}
+
+	switch {
+	case previous.WebEnabled && !current.WebEnabled:
+		if err := h.webFront.Stop(); err != nil {
+			return false, fmt.Errorf("cannot stop the web front: %w", err)
+		}
+
+		return false, nil
+	case !previous.WebEnabled && current.WebEnabled,
+		listenChanged && h.webFront.Listen() != "":
+		// Rebind starts a stopped front and is a no-op on the address it
+		// already serves, so both "switched on" and "moved" land here.
+		if err := h.webFront.Rebind(current.WebListen); err != nil {
+			return false, fmt.Errorf("cannot start the web front on %s: %w", current.WebListen, err)
+		}
+	}
+
+	return false, nil
 }
 
 // EnableMtproto starts the proxy and persists the flag. PROTECTED.
@@ -522,7 +681,7 @@ func (h *Handler) EnableMtproto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.mtproto.Start(h.mtprotoConfig()); err != nil {
+	if err := h.mtproto.Start(h.MtprotoConfig()); err != nil {
 		// The two "you forgot something" cases are a 400 naming the field;
 		// anything else is genuinely broken.
 		switch {
@@ -590,10 +749,15 @@ func (h *Handler) GetMtprotoClientLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	domain := h.settings.Get().Mtproto.MaskingDomain
+	all := h.settings.Get()
+	domain := all.Mtproto.MaskingDomain
 	host, port := h.mtprotoPublic()
+	webHostname := all.EffectiveWebHostname()
 
-	if !mtproto.CanIssueLink(domain, host) {
+	canFakeTLS := mtproto.CanIssueLink(domain, host)
+	canWeb := mtproto.CanIssueWebLink(webHostname, all.Mtproto.WebEnabled, h.mtproto.Status().Running)
+
+	if !canFakeTLS && !canWeb {
 		// A link built from a missing piece is well-formed and fails silently
 		// inside Telegram, so say what is missing instead of handing one over.
 		writeError(w, http.StatusConflict,
@@ -602,10 +766,27 @@ func (h *Handler) GetMtprotoClientLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeSuccess(w, map[string]any{
-		"tg":  mtproto.ProxyLink(host, port, client.Secret, domain),
-		"web": mtproto.WebLink(host, port, client.Secret, domain),
-	})
+	// Each form is null when it cannot be issued, rather than the whole answer
+	// failing: a WEB link alone is still worth sharing, and the reverse.
+	data := map[string]any{"tg": nil, "web": nil, "webproxy": nil}
+
+	if canFakeTLS {
+		data["tg"] = mtproto.ProxyLink(host, port, client.Secret, domain)
+		data["web"] = mtproto.WebLink(host, port, client.Secret, domain)
+	}
+
+	if canWeb {
+		tg, web, err := mtproto.WebProxyLinks(webHostname, client.Secret)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+
+			return
+		}
+
+		data["webproxy"] = map[string]string{"tg": tg, "web": web}
+	}
+
+	writeSuccess(w, data)
 }
 
 // GetMtprotoConnections returns the live matched streams. PROTECTED.

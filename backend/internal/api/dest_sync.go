@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"time"
 
 	"routebox/backend/internal/bootstrap"
@@ -30,6 +31,16 @@ func (h *Handler) syncDest() error {
 	s := h.settings.Get()
 	if !s.Server.Bootstrapped || s.Server.Caddyfile == "" {
 		return nil
+	}
+
+	// The Caddyfile itself first: it names the routes the credential list is
+	// imported into, and a plan that no longer matches the settings (a moved
+	// web front, a WEB proxy switched on) would leave the naive reload below
+	// reloading the stale one.
+	if h.caddyReplan != nil {
+		if err := h.caddyReplan(); err != nil {
+			return fmt.Errorf("caddyfile: %w", err)
+		}
 	}
 
 	// Disabled and expired users are rejected inside sing-box by the managed
