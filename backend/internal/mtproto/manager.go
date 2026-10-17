@@ -134,6 +134,11 @@ type Manager struct {
 	// tokenKey signs the handler's bootstrap and session tokens. It is per
 	// manager, not per Start, so a Rebuild does not log every WEB client out.
 	tokenKey []byte
+
+	// networkOverride replaces the network buildNetwork would pick. A test
+	// seam only, never set in production: it lets the end-to-end test send
+	// the proxy's Telegram dials to an in-process fake datacenter.
+	networkOverride mtglib.Network
 }
 
 // NewManager constructs a stopped manager over a roster.
@@ -197,6 +202,10 @@ func (m *Manager) startLocked(cfg Config) error {
 	ntw, err := buildNetwork(cfg)
 	if err != nil {
 		return err
+	}
+
+	if m.networkOverride != nil {
+		ntw = m.networkOverride
 	}
 
 	proxy, err := mtglib.NewProxy(mtglib.ProxyOpts{
