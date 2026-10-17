@@ -21,6 +21,9 @@
 		/** All-in-one install: the Fake TLS port is not published, so the MTProto
 		 *  link is a fallback that will not connect from outside. */
 		webManaged?: boolean;
+		/** WEB proxy is enabled but its link cannot be issued (no hostname, or the
+		 *  proxy is not running). Only changes the wording of the dead buttons. */
+		webBlocked?: boolean;
 		fakeTlsPort?: string;
 		readOnly?: boolean;
 		onChange: () => void | Promise<void>;
@@ -31,14 +34,23 @@
 		canShare,
 		canShareWeb = false,
 		webManaged = false,
+		webBlocked = false,
 		fakeTlsPort = '',
 		readOnly = false,
 		onChange
 	}: Props = $props();
 
 	const canShareAny = $derived(canShare || canShareWeb);
-	// Which message explains a dead button: the WEB link has its own missing piece.
-	const blockedTitle = $derived(canShareAny ? '' : $t('telegram.linkBlocked'));
+	// The buttons are dead only when neither link can be issued. Each reason
+	// that applies is named: the Fake TLS link lacks a masking domain or public
+	// host, the WEB link lacks a hostname or a running proxy.
+	const blockedTitle = $derived(
+		canShareAny
+			? ''
+			: [$t('telegram.linkBlocked'), webBlocked ? $t('telegram.webLinkBlocked') : '']
+					.filter(Boolean)
+					.join(' ')
+	);
 
 	let newName = $state('');
 	let adding = $state(false);

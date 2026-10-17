@@ -2155,7 +2155,7 @@
     "webLink": "WEB proxy link",
     "mtprotoLink": "MTProto link (Fake TLS)",
     "fakeTlsUnpublished": "Fake TLS port {port} is not published on this install, so this link will not connect. Use the WEB proxy link.",
-    "webLinkBlocked": "Set a hostname for the WEB proxy before sharing its link."
+    "webLinkBlocked": "The WEB proxy link is not available. Set a hostname for it and start the proxy, then share the link."
   },
   "mieruPattern": {
     "title": "Traffic pattern",

@@ -22,6 +22,8 @@
 	const canShare = $derived(!!proxy?.can_issue_link);
 	// Either link is worth handing out: the WEB proxy one needs no Fake TLS port.
 	const canShareWeb = $derived(!!proxy?.web.can_issue_link);
+	// WEB is switched on yet cannot hand out a link: say what it is missing.
+	const webBlocked = $derived(!!proxy?.web.enabled && !proxy.web.can_issue_link);
 	const readOnly = $derived(!!proxy?.read_only);
 	const formDirty = $derived(
 		!!form && !!proxy && JSON.stringify(form) !== JSON.stringify(proxy.settings)
@@ -227,8 +229,13 @@
 
 		{#if !running && blockedReason}
 			<div class="note-line">{blockedReason}</div>
-		{:else if !canShare && !canShareWeb}
-			<div class="note-line">{$t('telegram.linkBlocked')}</div>
+		{:else}
+			{#if !canShare && !canShareWeb}
+				<div class="note-line">{$t('telegram.linkBlocked')}</div>
+			{/if}
+			{#if webBlocked}
+				<div class="note-line">{$t('telegram.webLinkBlocked')}</div>
+			{/if}
 		{/if}
 
 		<!-- Clients — centerpiece -->
@@ -240,7 +247,7 @@
 				</div>
 			</div>
 			<div class="clients-body">
-				<ClientRoster {clients} {canShare} {canShareWeb} webManaged={proxy.web.managed} fakeTlsPort={proxy.settings.listen.split(':').pop() ?? ''} {readOnly} onChange={refresh} />
+				<ClientRoster {clients} {canShare} {canShareWeb} {webBlocked} webManaged={proxy.web.managed} fakeTlsPort={proxy.settings.listen.split(':').pop() ?? ''} {readOnly} onChange={refresh} />
 			</div>
 		</div>
 
