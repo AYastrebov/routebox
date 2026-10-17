@@ -655,8 +655,9 @@ func main() {
 	if effectiveMode == "vps" {
 		// Ahead of everything below that reads the Telegram proxy's keys: the
 		// port-collision check, the Caddyfile re-plan and the proxy auto-start.
-		if err := migrateBootstrapMtproto(settingsMgr); err != nil {
-			log.Printf("WARNING: %v", err)
+		migrateErr := migrateBootstrapMtproto(settingsMgr)
+		if migrateErr != nil {
+			log.Printf("WARNING: %v", migrateErr)
 		}
 		s := settingsMgr.Get()
 		stubRoot := stubRootOf(settingsMgr.GetPath(), resolvedConfigPath)
@@ -680,8 +681,10 @@ func main() {
 			// to keep looking ordinary.
 			startBootstrapFront(front, s.Mtproto.WebListen, replan)
 			// Fake TLS and dest on one port is a fight one of them loses at
-			// bind time, and which one depends on start order.
-			if _, mtPort, err := net.SplitHostPort(s.Mtproto.Listen); err == nil {
+			// bind time, and which one depends on start order. The migration
+			// above moves mtproto.listen off dest's port and says so; this is
+			// only for when it could not.
+			if _, mtPort, err := net.SplitHostPort(s.Mtproto.Listen); migrateErr != nil && err == nil {
 				if _, destPort, err := net.SplitHostPort(s.Server.Dest); err == nil && mtPort == destPort {
 					log.Printf("WARNING: the Telegram proxy (mtproto.listen %s) and dest (%s) share port %s: one of them will fail to bind. Move mtproto.listen.", s.Mtproto.Listen, s.Server.Dest, mtPort)
 				}
