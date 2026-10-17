@@ -3,9 +3,13 @@ package mtproto
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/9seconds/mtg/v2/mtglib"
+	"github.com/9seconds/mtg/v2/mtglib/web"
 )
 
 // SecretKeyBytes is the length of an MTProto secret's key half.
@@ -60,4 +64,29 @@ func ProxyLink(host string, port int, secretHex, maskingDomain string) string {
 // exists because tg:// links do not survive every chat client and browser.
 func WebLink(host string, port int, secretHex, maskingDomain string) string {
 	return "https://t.me/proxy?" + proxyQuery(host, port, secretHex, maskingDomain)
+}
+
+// WebProxyLinks builds the tg://webproxy and https://t.me/webproxy links for a
+// client. They carry the "dd" form of the secret and no port or masking
+// domain: the WEB proxy is reached over HTTPS on the hostname itself.
+func WebProxyLinks(hostname, secretHex string) (tg, webLink string, err error) {
+	raw, err := hex.DecodeString(secretHex)
+	if err != nil || len(raw) != SecretKeyBytes {
+		return "", "", errors.New("malformed secret key")
+	}
+
+	var secret mtglib.Secret
+
+	copy(secret.Key[:], raw)
+
+	tg, webLink = web.Links(hostname, secret)
+
+	return tg, webLink, nil
+}
+
+// CanIssueWebLink reports whether a WEB link is worth offering: it needs a
+// hostname, the feature switched on and a proxy actually serving it. Anything
+// less yields a link that fails silently inside Telegram.
+func CanIssueWebLink(hostname string, enabled, running bool) bool {
+	return strings.TrimSpace(hostname) != "" && enabled && running
 }

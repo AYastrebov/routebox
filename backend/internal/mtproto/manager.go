@@ -1,16 +1,21 @@
 package mtproto
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/9seconds/mtg/v2/antireplay"
 	"github.com/9seconds/mtg/v2/ipblocklist"
 	"github.com/9seconds/mtg/v2/mtglib"
+	"github.com/9seconds/mtg/v2/mtglib/web"
 	network "github.com/9seconds/mtg/v2/network/v2"
 )
 
@@ -56,7 +61,31 @@ type Config struct {
 	// directly, which is the default and what every install did before this
 	// existed.
 	SocksProxy string
+
+	// Web enables the Telegram WEB proxy next to Fake TLS. Nil means Fake TLS
+	// only.
+	Web *WebConfig
 }
+
+// WebConfig is the WEB proxy half of Config. Nil means Fake TLS only.
+type WebConfig struct {
+	// Hostname is the public DNS name clients reach the WEB proxy on. It must
+	// be canonical (lowercase, no port, no trailing dot); the handler refuses
+	// anything else, and so does Start.
+	Hostname string
+
+	// TrustedProxies are peers allowed to set X-Forwarded-For. Loopback is
+	// always trusted on top of these, because the web front lives there.
+	TrustedProxies []netip.Prefix
+
+	// Public is what strangers get: every request without an authentic
+	// secret. Never nil.
+	Public http.Handler
+}
+
+// WebFront is where the manager publishes its handler; webfront.Front
+// satisfies it. An interface keeps this package free of the front's imports.
+type WebFront interface{ SetWebHandler(http.Handler) }
 
 // Status is what the panel's header strip shows.
 type Status struct {
@@ -65,6 +94,14 @@ type Status struct {
 	Clients   int       `json:"clients"`
 	Connected int       `json:"connected"`
 	StartedAt time.Time `json:"started_at,omitempty"`
+	Web       WebStatus `json:"web"`
+}
+
+// WebStatus is the WEB proxy's share of the header strip.
+type WebStatus struct {
+	Enabled  bool `json:"enabled"`
+	Sessions int  `json:"sessions"`
+	Streams  int  `json:"streams"`
 }
 
 // Manager owns the listener, the mtglib proxy and the event stream. One
@@ -87,11 +124,37 @@ type Manager struct {
 
 	startedAt time.Time
 	clients   int
+
+	// web is the WEB proxy handler of the running proxy, nil when Fake TLS
+	// only or stopped. front is where it is published.
+	web   *web.Handler
+	front WebFront
+
+	// tokenKey signs the handler's bootstrap and session tokens. It is per
+	// manager, not per Start, so a Rebuild does not log every WEB client out.
+	tokenKey []byte
 }
 
 // NewManager constructs a stopped manager over a roster.
 func NewManager(store *Store) *Manager {
-	return &Manager{store: store, logs: NewLogBuffer(DefaultLogBufferSize)}
+	key := make([]byte, 32)
+
+	// A broken RNG is not recoverable, and a guessable signing key would let
+	// anyone mint sessions, so refuse to run rather than limp on.
+	if _, err := rand.Read(key); err != nil {
+		panic(fmt.Sprintf("mtproto: cannot read random bytes: %v", err))
+	}
+
+	return &Manager{store: store, logs: NewLogBuffer(DefaultLogBufferSize), tokenKey: key}
+}
+
+// SetWebFront sets where the WEB proxy handler is published. Call it before
+// Start; a handler already published is not moved.
+func (m *Manager) SetWebFront(f WebFront) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.front = f
 }
 
 // Logs exposes the proxy's recent log lines, so the panel can show what the
@@ -164,7 +227,25 @@ func (m *Manager) startLocked(cfg Config) error {
 		return fmt.Errorf("cannot listen on %s: %w", cfg.Listen, err)
 	}
 
+	var handler *web.Handler
+
+	if cfg.Web != nil {
+		handler, err = buildWebHandler(cfg.Web, secrets, proxy, m.tokenKey, m.logs)
+		if err != nil {
+			_ = lis.Close()
+			proxy.Shutdown()
+
+			return fmt.Errorf("cannot build web proxy: %w", err)
+		}
+	}
+
 	served := make(chan struct{})
+
+	m.web = handler
+
+	if handler != nil && m.front != nil {
+		m.front.SetWebHandler(handler)
+	}
 
 	m.proxy = proxy
 	m.lis = lis
@@ -182,6 +263,39 @@ func (m *Manager) startLocked(cfg Config) error {
 	}()
 
 	return nil
+}
+
+// buildWebHandler builds the WEB proxy handler over the same secret list the
+// proxy got, so profile index i is secret i and the event stream's client
+// names line up with it.
+func buildWebHandler(
+	cfg *WebConfig,
+	secrets []mtglib.Secret,
+	proxy *mtglib.Proxy,
+	tokenKey []byte,
+	logs *LogBuffer,
+) (*web.Handler, error) {
+	profiles := make([]web.Profile, 0, len(secrets))
+
+	for i, s := range secrets {
+		profiles = append(profiles, web.Profile{Index: i, Secret: s})
+	}
+
+	trusted := []netip.Prefix{
+		netip.MustParsePrefix("127.0.0.0/8"),
+		netip.MustParsePrefix("::1/128"),
+	}
+	trusted = append(trusted, cfg.TrustedProxies...)
+
+	return web.NewHandler(web.Options{
+		Hostname:       cfg.Hostname,
+		Profiles:       profiles,
+		Serve:          proxy.ServeWebConn,
+		Public:         cfg.Public,
+		TrustedProxies: trusted,
+		TokenKey:       tokenKey,
+		Logger:         newBufferedLogger(logs).Named("web"),
+	})
 }
 
 // buildNetwork picks how the proxy reaches Telegram: straight out of the box, or
@@ -238,6 +352,23 @@ func (m *Manager) stopLocked() error {
 	// promptly whether or not Serve had started.
 	<-m.served
 
+	// The web handler goes before the proxy: its sessions feed streams into
+	// the proxy, and the front must stop sending it requests first. Reverting
+	// the front hands strangers the stub site while the handler drains, and
+	// the drain is bounded so a stuck stream cannot hold Stop forever.
+	if m.web != nil {
+		if m.front != nil {
+			m.front.SetWebHandler(nil)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), web.DefaultTimeouts().Shutdown)
+		_ = m.web.Shutdown(ctx)
+
+		cancel()
+
+		m.web = nil
+	}
+
 	m.proxy.Shutdown()
 
 	m.proxy = nil
@@ -276,6 +407,27 @@ func (m *Manager) Rebuild() error {
 	return m.startLocked(cfg)
 }
 
+// Reconfigure applies a new Config to a running proxy, and is a no-op when
+// stopped.
+//
+// Rebuild reuses the Config saved at Start, so a settings change (listen
+// address, masking domain, outbound, the WEB keys) would never reach a running
+// proxy through it. Like Rebuild, a failure leaves the proxy stopped.
+func (m *Manager) Reconfigure(cfg Config) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proxy == nil {
+		return nil
+	}
+
+	if err := m.stopLocked(); err != nil {
+		return err
+	}
+
+	return m.startLocked(cfg)
+}
+
 // Status reports what the panel header shows.
 func (m *Manager) Status() Status {
 	m.mu.Lock()
@@ -289,6 +441,12 @@ func (m *Manager) Status() Status {
 
 	if status.Running {
 		status.StartedAt = m.startedAt
+	}
+
+	if m.web != nil {
+		stats := m.web.Stats()
+
+		status.Web = WebStatus{Enabled: true, Sessions: stats.SessionsLive, Streams: stats.StreamsLive}
 	}
 
 	if m.events != nil {
