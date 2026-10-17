@@ -603,3 +603,29 @@ func TestUpdateRetriesADownFrontWhileWebIsOn(t *testing.T) {
 		t.Errorf("front = %q, want it down while WEB is off", h.webFront.Listen())
 	}
 }
+
+// A bootstrapped install answers to server.public_host, which can be a name
+// the WEB handler refuses. WEB alone is skipped then, so the proxy start that
+// would have failed on it still brings Fake TLS up.
+func TestMtprotoConfigSkipsWebOnAHostnameTheHandlerRefuses(t *testing.T) {
+	h, _, _, _ := bootstrappedWebInstall(t)
+
+	if err := h.settings.Update(map[string]any{
+		"mtproto.web_enabled": true,
+		"server.public_host":  "203.0.113.7",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg := h.MtprotoConfig(); cfg.Web != nil {
+		t.Errorf("Web = %+v, want nil for an IP-literal hostname", cfg.Web)
+	}
+
+	if err := h.settings.Update(map[string]any{"server.public_host": "Media.Example.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg := h.MtprotoConfig(); cfg.Web == nil || cfg.Web.Hostname != "media.example.com" {
+		t.Errorf("Web = %+v, want it on the lowercased public host", cfg.Web)
+	}
+}

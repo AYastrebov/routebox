@@ -163,6 +163,7 @@ func TestCanIssueWebLink(t *testing.T) {
 		want     bool
 	}{
 		{"no hostname", "", true, true, false},
+		{"hostname the handler refuses", "1.2.3.4", true, true, false},
 		{"disabled", "h", false, true, false},
 		{"not running", "h", true, false, false},
 		{"all set", "h", true, true, true},

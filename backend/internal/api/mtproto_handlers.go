@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/9seconds/mtg/v2/mtglib/web"
 	"github.com/go-chi/chi/v5"
 
 	"routebox/backend/internal/bootstrap"
@@ -55,9 +56,23 @@ func (h *Handler) MtprotoConfig() mtproto.Config {
 	all := h.settings.Get()
 	s := all.Mtproto
 
-	var web *mtproto.WebConfig
+	var webCfg *mtproto.WebConfig
 
-	if hostname := all.EffectiveWebHostname(); s.WebEnabled && hostname != "" {
+	hostname := all.EffectiveWebHostname()
+	if s.WebEnabled && hostname != "" {
+		// A name the handler would refuse fails the whole proxy start, Fake
+		// TLS included. web_hostname is checked on save, but a bootstrapped
+		// install answers to server.public_host, which is validated for a URL
+		// and can still be an IP literal. WEB alone is skipped then, said once
+		// per (re)start, and Fake TLS keeps running.
+		if err := web.ValidateHostname(hostname); err != nil {
+			log.Printf("mtproto: WARNING the WEB proxy is skipped: %v", err)
+
+			hostname = ""
+		}
+	}
+
+	if s.WebEnabled && hostname != "" {
 		// A bootstrapped install's front already serves the stub site to
 		// strangers; the WEB proxy has to show them the same one, or the
 		// answer would change the moment the feature is switched on.
@@ -66,7 +81,7 @@ func (h *Handler) MtprotoConfig() mtproto.Config {
 			stubDir = h.stubRoot
 		}
 
-		web = &mtproto.WebConfig{
+		webCfg = &mtproto.WebConfig{
 			Hostname:       hostname,
 			TrustedProxies: settings.ParseTrustedProxies(all.Security.TrustedProxies),
 			Public:         webfront.NewStub(stubDir),
@@ -81,7 +96,7 @@ func (h *Handler) MtprotoConfig() mtproto.Config {
 		PreferIP:           s.PreferIP,
 		DomainFrontingPort: uint(s.DomainFrontingPort),
 		SocksProxy:         mtproto.SocksProxyAddr(s.Outbound, s.SocksPort),
-		Web:                web,
+		Web:                webCfg,
 	}
 }
 

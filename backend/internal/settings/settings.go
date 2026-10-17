@@ -24,9 +24,14 @@ import (
 // bootstrapped install serves everything on Server.PublicHost (one external
 // port, one name), so a separate hostname would only be able to disagree with
 // the certificate and the front; otherwise the operator's own setting wins.
+//
+// The public host is normalized on the way out — lowercased, a trailing dot
+// dropped — because it is validated for the panel's URL, not for the WEB
+// proxy, whose handler accepts only the canonical form. web_hostname needs no
+// such step: Update already rejects anything but that form.
 func (s Settings) EffectiveWebHostname() string {
 	if s.Server.Bootstrapped {
-		return s.Server.PublicHost
+		return strings.TrimSuffix(strings.ToLower(s.Server.PublicHost), ".")
 	}
 	return s.Mtproto.WebHostname
 }

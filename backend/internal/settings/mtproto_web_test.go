@@ -100,4 +100,11 @@ func TestEffectiveWebHostnameFollowsBootstrap(t *testing.T) {
 	if got := s.EffectiveWebHostname(); got != "panel.example.com" {
 		t.Errorf("bootstrapped: got %q, want Server.PublicHost", got)
 	}
+
+	// The WEB handler takes only the canonical form; the public host is
+	// validated for a URL, which allows more.
+	s.Server.PublicHost = "Panel.Example.COM."
+	if got := s.EffectiveWebHostname(); got != "panel.example.com" {
+		t.Errorf("bootstrapped: got %q, want the public host lowercased without the trailing dot", got)
+	}
 }
