@@ -94,6 +94,15 @@ type naiveSyncError struct{ err error }
 func (e *naiveSyncError) Error() string { return "naive users: " + e.err.Error() }
 func (e *naiveSyncError) Unwrap() error { return e.err }
 
+// destErrorIsRepeat reports whether a syncDest error is nothing but a
+// Caddyfile re-plan failure already reported, with nothing it depends on
+// changed since (bootstrap.ErrReplanRepeated). A timer-driven caller logs the
+// first one and leaves the repeats out; a naive sync failure is always new.
+func destErrorIsRepeat(err error) bool {
+	var naive *naiveSyncError
+	return errors.Is(err, bootstrap.ErrReplanRepeated) && !errors.As(err, &naive)
+}
+
 // destSyncWarning words a syncDest error for an API answer, naming which half
 // failed: a Caddyfile re-plan leaves dest on its previous routes, a naive sync
 // leaves naive on the previous user list, and the operator has to know which.

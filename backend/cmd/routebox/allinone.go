@@ -304,7 +304,8 @@ func startBootstrapFront(front *webfront.Front, listen string, replan func() err
 
 // caddyReplanner returns the one function that keeps a bootstrapped install's
 // Caddyfile in step with its settings and active sing-box config: run once at
-// startup, before every naive sync on apply, and after the web front moves.
+// startup, before every naive sync on apply (and on every expiry tick), and
+// after the web front moves.
 //
 // Everything the Caddyfile depends on is re-derived on each call rather than
 // captured here, so a changed domain, panel gate or web_listen is followed
@@ -317,6 +318,13 @@ func startBootstrapFront(front *webfront.Front, listen string, replan func() err
 // operator's choice is not ours to do. Neither is touching a Caddyfile the
 // operator has taken over with BOOTSTRAP_CADDYFILE_REPLAN=0, which is said
 // once, here, instead of on every apply.
+//
+// The expiry ticker calls this every 30 seconds, so a standing problem must
+// not be re-reported, or re-sent to dest, on every tick. A skip is logged once
+// per distinct cause. A failure is remembered with what it was planned from
+// (the parameters and the file on disk): while neither changes, dest is not
+// asked again and the same error comes back marked ErrReplanRepeated, which
+// the ticker's callers do not log a second time.
 func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, stubRoot string) func() error {
 	if bootstrap.ReplanDisabled() {
 		if s := sm.Get().Server; s.Bootstrapped && s.Caddyfile != "" {
@@ -325,7 +333,24 @@ func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, st
 		return func() error { return nil }
 	}
 
-	var mu sync.Mutex
+	var (
+		mu sync.Mutex
+		// lastSkip and lastRealityWarning are the causes last logged, so a
+		// standing one is said once.
+		lastSkip, lastRealityWarning string
+		// failedInputs is what the last failed attempt was planned from, and
+		// failedErr its error; nil once an attempt goes through.
+		failedInputs string
+		failedErr    error
+	)
+	// remember records a failure, answering a repeat of the last one as such.
+	remember := func(inputs string, err error) error {
+		if failedErr != nil && inputs == failedInputs {
+			return bootstrap.RepeatedReplan(failedErr)
+		}
+		failedInputs, failedErr = inputs, err
+		return err
+	}
 	return func() error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -349,22 +374,46 @@ func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, st
 		active := cfg.GetActive()
 		p, err := bootstrap.CaddyParamsFromInstall(in, active)
 		if errors.Is(err, bootstrap.ErrReplanSkipped) {
-			log.Printf("Caddyfile re-plan skipped, %s left as it is: %v", in.Caddyfile, err)
+			if err.Error() != lastSkip {
+				log.Printf("Caddyfile re-plan skipped, %s left as it is: %v", in.Caddyfile, err)
+				lastSkip = err.Error()
+			}
 			return nil
 		}
+		lastSkip = ""
 		if err != nil {
-			return err
+			// A dest address the plan cannot read stands until the settings
+			// change, like a refusal does.
+			return remember("params\x00"+err.Error(), err)
 		}
 		// Reality's stolen name is the operator's to change in the sing-box
 		// config; a domain that moved without it makes the front relay a name
 		// dest no longer has a certificate for.
+		warning := ""
 		if name := bootstrap.RealityServerName(active); name != "" && name != in.Domain {
-			log.Printf("WARNING: the vless-reality inbound steals %q but dest is planned for %q: update the inbound's server_name, or the front relays a name dest has no certificate for.", name, in.Domain)
+			warning = fmt.Sprintf("WARNING: the vless-reality inbound steals %q but dest is planned for %q: update the inbound's server_name, or the front relays a name dest has no certificate for.", name, in.Domain)
 		}
+		if warning != lastRealityWarning {
+			if warning != "" {
+				log.Print(warning)
+			}
+			lastRealityWarning = warning
+		}
+
+		// The file on disk is part of what the attempt is planned from: the
+		// staging CA is read from it, and an operator who fixed it by hand has
+		// changed what dest would be asked.
+		existing, readErr := os.ReadFile(in.Caddyfile)
+		inputs := fmt.Sprintf("%+v\x00%v\x00%s", p, readErr, existing)
+		if failedErr != nil && inputs == failedInputs {
+			return bootstrap.RepeatedReplan(failedErr)
+		}
+
 		changed, err := bootstrap.SyncCaddyfile(p, in.Caddyfile)
 		if err != nil {
-			return err
+			return remember(inputs, err)
 		}
+		failedInputs, failedErr = "", nil
 		if changed {
 			log.Printf("Caddyfile %s re-planned from the current settings", in.Caddyfile)
 		}

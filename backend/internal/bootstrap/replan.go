@@ -32,6 +32,23 @@ type Install struct {
 // Caddyfile on disk keeps working, so the caller leaves it alone.
 var ErrReplanSkipped = errors.New("caddyfile re-plan skipped")
 
+// ErrReplanRepeated marks a re-plan that was not attempted again: nothing it
+// is planned from has changed since an attempt that failed, so asking dest
+// again would only earn the same refusal. The error it rides on reads as that
+// failure, and callers that run on a timer use this to say it once rather
+// than every tick.
+var ErrReplanRepeated = errors.New("caddyfile re-plan unchanged since it last failed")
+
+// RepeatedReplan wraps the error a re-plan last failed with, for a caller
+// that is answering a repeat of it without asking dest again: it reads as err
+// and matches both err and ErrReplanRepeated.
+func RepeatedReplan(err error) error { return &repeatedReplan{err: err} }
+
+type repeatedReplan struct{ err error }
+
+func (e *repeatedReplan) Error() string   { return e.err.Error() }
+func (e *repeatedReplan) Unwrap() []error { return []error{e.err, ErrReplanRepeated} }
+
 // ReplanDisabled is the operator's switch for hand-maintained Caddyfiles.
 func ReplanDisabled() bool {
 	switch strings.ToLower(os.Getenv("BOOTSTRAP_CADDYFILE_REPLAN")) {
