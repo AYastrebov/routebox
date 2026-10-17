@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -65,7 +66,7 @@ func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.stub.ServeHTTP(w, r)
 }
 
-// Listen returns the bound address, or "" when not running.
+// Listen returns the configured address, or "" when not running.
 func (f *Front) Listen() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -82,23 +83,32 @@ func (f *Front) Start(listen string) error {
 		return ErrAlreadyRunning
 	}
 
-	run, addr, err := f.bind(listen)
+	run, err := f.bind(listen)
 	if err != nil {
 		return err
 	}
 
-	f.run, f.listen = run, addr
+	f.run, f.listen = run, listen
 
 	return nil
 }
 
 // Rebind moves the front to a new address. The new listener is bound before
 // the old one is closed, so on failure the old one keeps serving. A stopped
-// front is started instead.
+// front is started instead, and rebinding to the address already in use is a
+// no-op (binding it again would fail with EADDRINUSE). Once the new listener
+// serves, Rebind returns: the old one stops accepting at once and its
+// in-flight requests drain in the background.
 func (f *Front) Rebind(listen string) error {
 	f.mu.Lock()
 
-	run, addr, err := f.bind(listen)
+	if f.run != nil && f.listen == listen {
+		f.mu.Unlock()
+
+		return nil
+	}
+
+	run, err := f.bind(listen)
 	if err != nil {
 		f.mu.Unlock()
 
@@ -106,10 +116,20 @@ func (f *Front) Rebind(listen string) error {
 	}
 
 	old := f.run
-	f.run, f.listen = run, addr
+	f.run, f.listen = run, listen
 	f.mu.Unlock()
 
-	return shutdown(old)
+	if old != nil {
+		_ = old.l.Close()
+
+		go func() {
+			if err := shutdown(old); err != nil {
+				log.Printf("webfront: draining the previous listener: %v", err)
+			}
+		}()
+	}
+
+	return nil
 }
 
 // Stop shuts the server down, waiting up to 15 s for in-flight requests and
@@ -125,10 +145,10 @@ func (f *Front) Stop() error {
 
 // bind opens listen and starts a server on it. A fresh http.Server per bind:
 // one cannot be reused after Shutdown.
-func (f *Front) bind(listen string) (*running, string, error) {
+func (f *Front) bind(listen string) (*running, error) {
 	l, err := net.Listen("tcp", listen)
 	if err != nil {
-		return nil, "", fmt.Errorf("listen %s: %w", listen, err)
+		return nil, fmt.Errorf("listen %s: %w", listen, err)
 	}
 
 	srv := &http.Server{
@@ -142,7 +162,7 @@ func (f *Front) bind(listen string) (*running, string, error) {
 
 	go func() { _ = srv.Serve(l) }()
 
-	return &running{srv: srv, l: l}, l.Addr().String(), nil
+	return &running{srv: srv, l: l}, nil
 }
 
 func shutdown(r *running) error {

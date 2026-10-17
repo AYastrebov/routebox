@@ -175,3 +175,60 @@ func TestRebindWhenStoppedStarts(t *testing.T) {
 
 	mustGet(t, addr, "stub")
 }
+
+func TestRebindToTheSameAddressIsANoop(t *testing.T) {
+	f, addr := startFront(t, textHandler("stub"))
+
+	if err := f.Rebind(addr); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.Listen() != addr {
+		t.Fatalf("Listen() = %q, want %q", f.Listen(), addr)
+	}
+
+	mustGet(t, addr, "stub")
+}
+
+func TestRebindDoesNotWaitForInFlightRequests(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+
+	f, old := startFront(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = io.WriteString(w, "slow")
+	}))
+
+	type result struct {
+		body string
+		err  error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		body, err := get(t, old)
+		done <- result{body, err}
+	}()
+
+	<-started
+
+	rebound := make(chan error, 1)
+
+	go func() { rebound <- f.Rebind(freeAddr(t)) }()
+
+	select {
+	case err := <-rebound:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Rebind blocked on an in-flight request")
+	}
+
+	close(release)
+
+	if r := <-done; r.err != nil || r.body != "slow" {
+		t.Fatalf("in-flight request got %q, %v", r.body, r.err)
+	}
+}
