@@ -373,7 +373,7 @@ export const api = {
 	mtprotoEnable: () => request<MtprotoStatus>('/mtproto/enable', { method: 'POST' }),
 	mtprotoDisable: () => request<MtprotoStatus>('/mtproto/disable', { method: 'POST' }),
 	updateMtprotoSettings: (patch: Partial<MtprotoSettings>) =>
-		request<MtprotoSettings & { warning?: string }>('/mtproto', { method: 'PUT', body: JSON.stringify(patch) }),
+		request<MtprotoSettings>('/mtproto', { method: 'PUT', body: JSON.stringify(patch) }),
 	getMtprotoClients: () => request<MtprotoClient[]>('/mtproto/clients'),
 	getMtprotoConnections: () => request<MtprotoConnection[]>('/mtproto/connections'),
 	createMtprotoClient: (name: string) =>

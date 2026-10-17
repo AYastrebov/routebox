@@ -114,7 +114,7 @@
 		if (!form) return;
 		saving = true;
 		try {
-			const saved = await api.updateMtprotoSettings({
+			await api.updateMtprotoSettings({
 				listen: form.listen,
 				masking_domain: form.masking_domain.trim(),
 				public_host: form.public_host.trim(),
@@ -131,8 +131,6 @@
 				web_public_dir: form.web_public_dir.trim()
 			});
 			notifications.success($t('telegram.settingsSaved'));
-			// Saved, but something downstream (the dest Caddyfile) did not follow.
-			if (saved.warning) notifications.warning(saved.warning);
 			await refresh();
 			if (proxy) form = cloneSettings(proxy.settings);
 		} catch (e) {
