@@ -342,7 +342,10 @@
 		font-size: 0.75rem;
 		color: var(--ctp-overlay0);
 	}
-	.field input,
+	/* Not the checkbox: this is the text-field skin, and app.css already draws
+	   the 1rem square checkbox — padded and bordered like a text field it
+	   turned into a wide pill with a tick in it. */
+	.field input:not([type='checkbox']),
 	.field select {
 		/* background-color, not the `background` shorthand: the shorthand also
 		   resets background-image, and that is where app.css draws the chevron
@@ -404,7 +407,7 @@
 		font-size: 0.75rem;
 		resize: vertical;
 	}
-	.field input:focus,
+	.field input:not([type='checkbox']):focus,
 	.field select:focus {
 		outline: none;
 		border-color: var(--ctp-primary);
