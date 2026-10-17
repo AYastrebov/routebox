@@ -114,10 +114,12 @@ func inboundTransport(ib map[string]interface{}, key string) string {
 // with the file untouched. Only an unreachable dest skips the check — then there
 // is nothing running to take down, and the file is written for dest's next start.
 //
-// changed reports whether the file was rewritten, also when the reload after it
-// failed.
+// changed reports whether the file now on disk differs from the one before. A
+// refused reload restores the previous file and reports false; only a failed
+// restore leaves changed true, since the refused file is then still there.
 func SyncCaddyfile(p Params, path string) (changed bool, err error) {
 	existing, err := os.ReadFile(path)
+	existed := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, fmt.Errorf("read %s: %w", path, err)
 	}
@@ -150,7 +152,19 @@ func SyncCaddyfile(p Params, path string) (changed bool, err error) {
 			log.Printf("bootstrap: %v; the new Caddyfile applies when dest starts", err)
 			return true, nil
 		}
-		return true, err
+		// /adapt only parses; /load can still refuse (provisioning, imports,
+		// listeners). Caddy rolls back in memory, but dest's next start reads the
+		// file, so a refused Caddyfile must not stay on disk.
+		var restoreErr error
+		if existed {
+			restoreErr = util.WriteFileAtomic(path, existing, 0644)
+		} else {
+			restoreErr = os.Remove(path)
+		}
+		if restoreErr != nil {
+			return true, fmt.Errorf("%w; restoring the previous Caddyfile also failed, the refused one is still on disk: %v", err, restoreErr)
+		}
+		return false, err
 	}
 	return true, nil
 }

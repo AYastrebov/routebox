@@ -156,12 +156,30 @@ func TestSyncCaddyfileWritesWhenDestIsDown(t *testing.T) {
 	}
 }
 
-func TestSyncCaddyfileReportsARefusedLoad(t *testing.T) {
+func TestSyncCaddyfileRestoresTheFileWhenLoadRefuses(t *testing.T) {
+	p, path := syncFixture(t)
+	if err := os.WriteFile(path, []byte("old caddyfile\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fakeAdmin(t, 200, 400)
+	changed, err := SyncCaddyfile(p, path)
+	if changed || err == nil {
+		t.Fatalf("changed=%v err=%v, want false and an error", changed, err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "old caddyfile\n" {
+		t.Fatalf("refused file left on disk: %q", got)
+	}
+}
+
+func TestSyncCaddyfileRemovesTheFileWhenLoadRefusesAndNoneExisted(t *testing.T) {
 	p, path := syncFixture(t)
 	fakeAdmin(t, 200, 400)
 	changed, err := SyncCaddyfile(p, path)
-	if !changed || err == nil {
-		t.Fatalf("changed=%v err=%v, want true and an error", changed, err)
+	if changed || err == nil {
+		t.Fatalf("changed=%v err=%v, want false and an error", changed, err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("refused file left on disk: %v", err)
 	}
 }
 
