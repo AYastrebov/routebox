@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -362,7 +363,11 @@ func (m *Manager) stopLocked() error {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), web.DefaultTimeouts().Shutdown)
-		_ = m.web.Shutdown(ctx)
+		// Logged, not returned: the proxy below still has to stop, and a drain
+		// that ran out of time only means some WEB sessions were cut short.
+		if err := m.web.Shutdown(ctx); err != nil {
+			log.Printf("mtproto: WEB proxy shutdown: %v", err)
+		}
 
 		cancel()
 
