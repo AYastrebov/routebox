@@ -20,7 +20,7 @@ import (
 // already say.
 type Install struct {
 	Domain, Dest, PanelPath, Caddyfile, StubRoot, ACMEEmail string
-	FrontPort, PanelPort, WebFrontPort                       int
+	FrontPort, PanelPort, WebFrontPort                      int
 }
 
 // ErrReplanSkipped means the install no longer has what a Caddyfile is planned
