@@ -183,11 +183,12 @@ func TestSyncCaddyfileRemovesTheFileWhenLoadRefusesAndNoneExisted(t *testing.T) 
 	}
 }
 
-func TestSyncCaddyfileKeepsTheStagingCA(t *testing.T) {
+// R15: the re-plan follows network.acme_staging only in the safe direction.
+func TestSyncCaddyfileLeavesStagingWhenTheSettingIsOff(t *testing.T) {
 	p, path := syncFixture(t)
 	staged := p
 	staged.ACME.Staging = true
-	if err := os.WriteFile(path, []byte("# old\n"+stagingCA+"\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(caddyfileOK(t, staged)), 0644); err != nil {
 		t.Fatal(err)
 	}
 	fakeAdmin(t, 200, 200)
@@ -196,7 +197,66 @@ func TestSyncCaddyfileKeepsTheStagingCA(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(path)
-	if string(got) != caddyfileOK(t, staged) {
-		t.Fatalf("staging CA was dropped:\n%s", got)
+	if string(got) != caddyfileOK(t, p) {
+		t.Fatalf("a staging file with the setting off was not moved to production:\n%s", got)
+	}
+}
+
+func TestSyncCaddyfileKeepsTheStagingCAWhileTheSettingIsOn(t *testing.T) {
+	p, path := syncFixture(t)
+	p.ACME.Staging = true
+	if err := os.WriteFile(path, []byte("# old\n"+stagingCA+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fakeAdmin(t, 200, 200)
+	if _, err := SyncCaddyfile(p, path); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != caddyfileOK(t, p) || !strings.Contains(string(got), stagingCA) {
+		t.Fatalf("the staging CA was dropped while the setting is on:\n%s", got)
+	}
+}
+
+func TestSyncCaddyfileNeverMovesProductionToStaging(t *testing.T) {
+	p, path := syncFixture(t)
+	production := p
+	production.ACME.Staging = false
+	if err := os.WriteFile(path, []byte("# old, production\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fakeAdmin(t, 200, 200)
+	p.ACME.Staging = true
+	if _, err := SyncCaddyfile(p, path); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != caddyfileOK(t, production) || strings.Contains(string(got), stagingCA) {
+		t.Fatalf("a production file was moved to the staging CA:\n%s", got)
+	}
+}
+
+func TestSyncCaddyfileFollowsTheSettingWithNoFileYet(t *testing.T) {
+	p, path := syncFixture(t)
+	p.ACME.Staging = true
+	fakeAdmin(t, 200, 200)
+	if _, err := SyncCaddyfile(p, path); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if !strings.Contains(string(got), stagingCA) {
+		t.Fatalf("a first plan ignored the staging setting:\n%s", got)
+	}
+}
+
+func TestCaddyParamsFromInstallCarriesTheStagingSetting(t *testing.T) {
+	in := installFixture()
+	in.ACMEStaging = true
+	got, err := CaddyParamsFromInstall(in, planOK(t, fixture()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ACME.Staging {
+		t.Fatal("ACME.Staging = false, want network.acme_staging carried over")
 	}
 }

@@ -341,6 +341,7 @@ func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, st
 			Caddyfile:    all.Server.Caddyfile,
 			StubRoot:     stubRoot,
 			ACMEEmail:    all.Network.ACMEEmail,
+			ACMEStaging:  all.Network.ACMEStaging,
 			FrontPort:    all.Server.FrontPort,
 			PanelPort:    panelPort,
 			WebFrontPort: panelPortOf(all.Mtproto.WebListen),

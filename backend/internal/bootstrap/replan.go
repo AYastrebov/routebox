@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"routebox/backend/internal/util"
 )
@@ -21,6 +22,9 @@ import (
 type Install struct {
 	Domain, Dest, PanelPath, Caddyfile, StubRoot, ACMEEmail string
 	FrontPort, PanelPort, WebFrontPort                      int
+	// ACMEStaging is network.acme_staging. SyncCaddyfile follows it only in
+	// the safe direction: off a staging file onto production, never back.
+	ACMEStaging bool
 }
 
 // ErrReplanSkipped means the install no longer has what a Caddyfile is planned
@@ -73,7 +77,7 @@ func CaddyParamsFromInstall(in Install, active map[string]interface{}) (Params, 
 			WebFront:  in.WebFrontPort,
 		},
 		Paths: Paths{VlessGRPC: grpcName, TrojanWS: wsPath, Panel: in.PanelPath},
-		ACME:  ACME{Email: in.ACMEEmail},
+		ACME:  ACME{Email: in.ACMEEmail, Staging: in.ACMEStaging},
 	}, nil
 }
 
@@ -123,10 +127,7 @@ func SyncCaddyfile(p Params, path string) (changed bool, err error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, fmt.Errorf("read %s: %w", path, err)
 	}
-	// The staging CA is an operator's hand edit that is not a setting anywhere;
-	// carrying it over is what keeps a trial install from flipping to the
-	// production CA on the next start.
-	p.ACME.Staging = strings.Contains(string(existing), stagingCA)
+	p.ACME.Staging = replanStaging(existing, existed, p.ACME.Staging)
 	rendered, err := PlanCaddyfile(p)
 	if err != nil {
 		return false, err
@@ -167,6 +168,36 @@ func SyncCaddyfile(p Params, path string) (changed bool, err error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// stagingIgnored makes the "already on production" notice once per process:
+// every re-plan would repeat it otherwise, on every apply and every expiry
+// tick, for as long as the setting stays on.
+var stagingIgnored sync.Once
+
+// replanStaging decides whether the re-planned Caddyfile uses Let's Encrypt's
+// staging CA, given the file on disk and network.acme_staging (want).
+//
+// The setting is followed only in the safe direction. A staging file with the
+// setting off goes to production: the operator has finished the trial run. A
+// production file stays on production whatever the setting says: swapping a
+// working certificate for a staging one, which no browser trusts, would take
+// the site down over a flag, so that is said once and ignored. With no file
+// yet there is no certificate to lose, and the setting decides, as it does for
+// the bootstrap's first plan.
+func replanStaging(existing []byte, existed, want bool) bool {
+	if !existed {
+		return want
+	}
+	if !strings.Contains(string(existing), stagingCA) {
+		if want {
+			stagingIgnored.Do(func() {
+				log.Printf("bootstrap: network.acme_staging is on, but dest's Caddyfile already uses the production CA; it stays on production, since a staging certificate would replace one browsers trust")
+			})
+		}
+		return false
+	}
+	return want
 }
 
 // adaptCaddyfile asks dest to parse text without running it. An ErrDestUnreachable
