@@ -42,4 +42,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/9seconds/mtg/v2 => github.com/AYastrebov/mtg/v2 v2.0.0-20261017104725-43edda78a9c2
+replace github.com/9seconds/mtg/v2 => github.com/AYastrebov/mtg/v2 v2.0.0-20261017111415-962efeccda0c

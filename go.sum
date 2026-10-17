@@ -1,5 +1,5 @@
-github.com/AYastrebov/mtg/v2 v2.0.0-20261017104725-43edda78a9c2 h1:01ViKkyk9fjyQ+YnIbfnIlW4PV0hTaGHr5kXBoYOcxg=
-github.com/AYastrebov/mtg/v2 v2.0.0-20261017104725-43edda78a9c2/go.mod h1:uAEczDPfZMNK3oTxPXi3Rflfiber6jQG3jeS6f4uPx4=
+github.com/AYastrebov/mtg/v2 v2.0.0-20261017111415-962efeccda0c h1:P5cssLf9CJ18Iv3vf0y1l9GZifwExv0XvyEH7Q7j23o=
+github.com/AYastrebov/mtg/v2 v2.0.0-20261017111415-962efeccda0c/go.mod h1:uAEczDPfZMNK3oTxPXi3Rflfiber6jQG3jeS6f4uPx4=
 github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk=
 github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/OneOfOne/xxhash v1.2.8 h1:31czK/TI9sNkxIKfaUfGlU47BAxQ0ztGgd9vPyqimf8=
