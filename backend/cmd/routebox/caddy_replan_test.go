@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"routebox/backend/internal/bootstrap"
 	"routebox/backend/internal/config"
@@ -207,5 +208,52 @@ func TestCaddyReplannerLogsAStandingSkipOnce(t *testing.T) {
 	}
 	if got := calls.Load(); got != 0 {
 		t.Errorf("dest was asked %d times for a skipped re-plan", got)
+	}
+}
+
+// A refusal can have a cause outside what the memory keys on (a port dest
+// could not bind, since freed), so after replanRetryAfter dest is asked again.
+// A retry refused the same way still reads as a repeat: logged once.
+func TestCaddyReplannerRetriesARefusalOnceItIsOld(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	replanClock = func() time.Time { return now }
+	t.Cleanup(func() { replanClock = time.Now })
+
+	sm, a, _ := installed(t)
+	if err := os.WriteFile(a.CaddyPath, []byte("# stale\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	calls := countingAdmin(t)
+	cfg, err := config.NewManager(a.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replan := caddyReplanner(sm, cfg, 8443, a.StubRoot)
+
+	if err := replan(); err == nil || errors.Is(err, bootstrap.ErrReplanRepeated) {
+		t.Fatalf("first replan: %v, want a fresh refusal", err)
+	}
+
+	now = now.Add(replanRetryAfter - time.Second)
+	if err := replan(); !errors.Is(err, bootstrap.ErrReplanRepeated) {
+		t.Fatalf("just before the expiry: %v, want the remembered refusal", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("dest was asked %d times before the expiry, want once", got)
+	}
+
+	now = now.Add(2 * time.Second)
+	err = replan()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("dest was asked %d times after the expiry, want a second time", got)
+	}
+	if !errors.Is(err, bootstrap.ErrReplanRepeated) || !strings.Contains(err.Error(), "fake dest says no") {
+		t.Errorf("the retry: %v, want the same refusal, marked as a repeat", err)
+	}
+
+	// The retry restarted the clock.
+	now = now.Add(replanRetryAfter - time.Second)
+	if err := replan(); !errors.Is(err, bootstrap.ErrReplanRepeated) || calls.Load() != 2 {
+		t.Errorf("after the retry: %v with %d calls, want the memory renewed", err, calls.Load())
 	}
 }

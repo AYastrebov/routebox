@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -302,6 +303,13 @@ func startBootstrapFront(front *webfront.Front, listen string, replan func() err
 	}
 }
 
+// replanRetryAfter is how long caddyReplanner trusts a remembered failure
+// before asking dest again; replanClock is its clock, a test seam.
+var (
+	replanRetryAfter = 5 * time.Minute
+	replanClock      = time.Now
+)
+
 // caddyReplanner returns the one function that keeps a bootstrapped install's
 // Caddyfile in step with its settings and active sing-box config: run once at
 // startup, before every naive sync on apply (and on every expiry tick), and
@@ -325,6 +333,12 @@ func startBootstrapFront(front *webfront.Front, listen string, replan func() err
 // (the parameters and the file on disk): while neither changes, dest is not
 // asked again and the same error comes back marked ErrReplanRepeated, which
 // the ticker's callers do not log a second time.
+//
+// The memory lasts replanRetryAfter. Not everything a refusal depends on is in
+// those inputs — a port dest could not bind that has since been freed, a full
+// disk, an upgraded dest — so a remembered refusal is tried again once it is
+// that old, by whichever call comes first. A retry that fails the same way is
+// still answered as a repeat, so the cause stays logged once.
 func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, stubRoot string) func() error {
 	if bootstrap.ReplanDisabled() {
 		if s := sm.Get().Server; s.Bootstrapped && s.Caddyfile != "" {
@@ -338,17 +352,30 @@ func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, st
 		// lastSkip and lastRealityWarning are the causes last logged, so a
 		// standing one is said once.
 		lastSkip, lastRealityWarning string
-		// failedInputs is what the last failed attempt was planned from, and
-		// failedErr its error; nil once an attempt goes through.
+		// failedInputs is what the last failed attempt was planned from,
+		// failedErr its error (nil once an attempt goes through), and failedAt
+		// when it was last tried.
 		failedInputs string
 		failedErr    error
+		failedAt     time.Time
 	)
-	// remember records a failure, answering a repeat of the last one as such.
-	remember := func(inputs string, err error) error {
-		if failedErr != nil && inputs == failedInputs {
+	// remembered answers a call whose inputs match the last failure, unless
+	// that failure is old enough to try again.
+	remembered := func(inputs string) error {
+		if failedErr != nil && inputs == failedInputs && replanClock().Sub(failedAt) < replanRetryAfter {
 			return bootstrap.RepeatedReplan(failedErr)
 		}
-		failedInputs, failedErr = inputs, err
+		return nil
+	}
+	// remember records a failure. One that repeats the last, on the same
+	// inputs and with the same text (a retry after the memory ran out), is
+	// answered as a repeat, so its cause is not logged a second time.
+	remember := func(inputs string, err error) error {
+		repeat := failedErr != nil && inputs == failedInputs && err.Error() == failedErr.Error()
+		failedInputs, failedErr, failedAt = inputs, err, replanClock()
+		if repeat {
+			return bootstrap.RepeatedReplan(err)
+		}
 		return err
 	}
 	return func() error {
@@ -384,7 +411,11 @@ func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, st
 		if err != nil {
 			// A dest address the plan cannot read stands until the settings
 			// change, like a refusal does.
-			return remember("params\x00"+err.Error(), err)
+			inputs := "params\x00" + err.Error()
+			if repeat := remembered(inputs); repeat != nil {
+				return repeat
+			}
+			return remember(inputs, err)
 		}
 		// Reality's stolen name is the operator's to change in the sing-box
 		// config; a domain that moved without it makes the front relay a name
@@ -405,8 +436,8 @@ func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, st
 		// changed what dest would be asked.
 		existing, readErr := os.ReadFile(in.Caddyfile)
 		inputs := fmt.Sprintf("%+v\x00%v\x00%s", p, readErr, existing)
-		if failedErr != nil && inputs == failedInputs {
-			return bootstrap.RepeatedReplan(failedErr)
+		if repeat := remembered(inputs); repeat != nil {
+			return repeat
 		}
 
 		changed, err := bootstrap.SyncCaddyfile(p, in.Caddyfile)
