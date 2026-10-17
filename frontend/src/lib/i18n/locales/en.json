@@ -2147,7 +2147,7 @@
     "webListen": "Listen address",
     "webListenHint": "Where RouteBox accepts the proxied requests. Keep it on loopback and point your reverse proxy here.",
     "webPublicDir": "Static site directory",
-    "webPublicDirHint": "Optional. Files served to anyone who opens the hostname in a browser; empty shows a stub page.",
+    "webPublicDirHint": "Optional. Files served to anyone who opens the hostname in a browser; left empty, every such request gets an empty 404.",
     "webSnippetTitle": "Reverse-proxy snippets",
     "webSnippetNginx": "nginx",
     "webSnippetCaddy": "Caddy",

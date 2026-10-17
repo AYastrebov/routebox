@@ -105,8 +105,11 @@ type MtprotoSettings struct {
 	// front relays to it.
 	WebListen string `toml:"web_listen" json:"web_listen"`
 
-	// WebPublicDir is the static-asset directory the handler serves. Empty
-	// lets the handler use its own default.
+	// WebPublicDir is the static site served to anyone who is not a WEB proxy
+	// client, both by the handler and, while the WEB proxy is off, by the
+	// front. Empty (or a directory that is not there) answers every such
+	// request with an empty 404: there is no built-in stub page. Ignored on a
+	// bootstrapped install, whose strangers get dest's stub root.
 	WebPublicDir string `toml:"web_public_dir" json:"web_public_dir"`
 }
 
