@@ -6,6 +6,8 @@ describe('nginxSnippet', () => {
 		const s = nginxSnippet('proxy.example.com', '127.0.0.1:9446');
 		for (const line of [
 			'server_name proxy.example.com;',
+			'ssl_certificate /etc/letsencrypt/live/proxy.example.com/fullchain.pem;',
+			'ssl_certificate_key /etc/letsencrypt/live/proxy.example.com/privkey.pem;',
 			'proxy_pass http://127.0.0.1:9446;',
 			'proxy_set_header Host $host;',
 			'proxy_set_header X-Forwarded-For $remote_addr;',
@@ -15,6 +17,11 @@ describe('nginxSnippet', () => {
 		]) {
 			expect(s).toContain(line);
 		}
+	});
+
+	it('marks the certificate paths as placeholders', () => {
+		const s = nginxSnippet('proxy.example.com', '127.0.0.1:9446');
+		expect(s).toMatch(/# Placeholders:.*\n.*\n\tssl_certificate /);
 	});
 
 	it('points a wildcard listen address at loopback', () => {
