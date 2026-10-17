@@ -6,16 +6,20 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	"github.com/google/uuid"
 
 	"routebox/backend/internal/bootstrap"
+	"routebox/backend/internal/config"
 	"routebox/backend/internal/settings"
 )
 
@@ -68,21 +72,11 @@ type allInOne struct {
 // planAllInOne fills in whatever the operator did not have to say. Returns an
 // error only for the one thing nobody can guess: the domain.
 func planAllInOne(cfg settings.Settings, settingsPath, configPath, listenAddr string) (allInOne, error) {
-	dir := filepath.Dir(settingsPath)
-	if settingsPath == "" {
-		dir = filepath.Dir(configPath)
-	}
-	// Absolute, because the stub root and the Caddyfile are read by Caddy — a
-	// different process with a different working directory, where a relative
-	// root silently serves nothing.
-	if abs, err := filepath.Abs(dir); err == nil {
-		dir = abs
-	}
 	a := allInOne{
 		Domain:     cfg.Server.PublicHost,
 		ConfigPath: configPath,
-		CaddyPath:  orDefault(os.Getenv(caddyfileEnv), filepath.Join(dir, "Caddyfile")),
-		StubRoot:   orDefault(os.Getenv(stubRootEnv), filepath.Join(dir, "stub")),
+		CaddyPath:  orDefault(os.Getenv(caddyfileEnv), filepath.Join(installDir(settingsPath, configPath), "Caddyfile")),
+		StubRoot:   stubRootOf(settingsPath, configPath),
 		PanelPort:  panelPortOf(listenAddr),
 		ACMEStagng: cfg.Network.ACMEStaging,
 		// The panel's own ACME is off in this layout, so this address would
@@ -97,6 +91,30 @@ func planAllInOne(cfg settings.Settings, settingsPath, configPath, listenAddr st
 		return a, fmt.Errorf("cannot tell which port the panel listens on from %q, so dest has nothing to forward to", listenAddr)
 	}
 	return a, nil
+}
+
+// installDir is the directory an install treats as its own: the one
+// routebox.toml lives in, or the config's when there is no settings file.
+// Absolute, because the stub root and the Caddyfile are read by Caddy — a
+// different process with a different working directory, where a relative root
+// silently serves nothing.
+func installDir(settingsPath, configPath string) string {
+	dir := filepath.Dir(settingsPath)
+	if settingsPath == "" {
+		dir = filepath.Dir(configPath)
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	return dir
+}
+
+// stubRootOf is the directory dest's stub site is served from. One rule for
+// the bootstrap that plans it, the re-plan that keeps the Caddyfile pointing
+// at it, and the web front that serves it — three readers that must agree, or
+// strangers would see a different site depending on who answered.
+func stubRootOf(settingsPath, configPath string) string {
+	return orDefault(os.Getenv(stubRootEnv), filepath.Join(installDir(settingsPath, configPath), "stub"))
 }
 
 // panelPortOf takes the port out of a listen address. 0 means "unusable", which
@@ -178,6 +196,19 @@ func runAllInOne(sm *settings.Manager, a allInOne, out io.Writer) error {
 	if err := sm.Update(map[string]interface{}{"network.acme_enabled": false}); err != nil {
 		return fmt.Errorf("turn the panel's own ACME off: %w", err)
 	}
+	// The Telegram WEB proxy needs a domain with a certificate and a front
+	// behind dest, which this layout already is — so it comes up on, masking
+	// as the install's own site. Fake TLS moves off its default 9443: that is
+	// dest's loopback port here, and the two would fight over it. Ahead of
+	// SetBootstrap, like the ACME switch above: Update only stages, and
+	// SetBootstrap's save is what makes all of it survive a restart.
+	if err := sm.Update(map[string]interface{}{
+		"mtproto.web_enabled":    true,
+		"mtproto.masking_domain": a.Domain,
+		"mtproto.listen":         "0.0.0.0:9447",
+	}); err != nil {
+		return fmt.Errorf("turn the Telegram WEB proxy on: %w", err)
+	}
 	dest := net.JoinHostPort(p.DestHost, strconv.Itoa(p.DestPort))
 	if err := sm.SetBootstrap(p.Paths.Panel, dest, a.CaddyPath, p.Ports.Front); err != nil {
 		return err
@@ -193,6 +224,75 @@ func runAllInOne(sm *settings.Manager, a allInOne, out io.Writer) error {
 	fmt.Fprintln(out, " `routebox panel-url` prints this address again.")
 	fmt.Fprintln(out, "==================================================================")
 	return nil
+}
+
+// caddyReplanner returns the one function that keeps a bootstrapped install's
+// Caddyfile in step with its settings and active sing-box config: run once at
+// startup, before every naive sync on apply, and after the web front moves.
+//
+// Everything the Caddyfile depends on is re-derived on each call rather than
+// captured here, so a changed domain, panel gate or web_listen is followed
+// without a restart. The calls are serialized: SyncCaddyfile writes through a
+// shared temporary file, and startup, an apply and a settings save can all
+// arrive at once.
+//
+// A skipped re-plan (an inbound the plan routes to was removed or reshaped by
+// hand) is not an error — the file on disk keeps working, and overwriting the
+// operator's choice is not ours to do. Neither is touching a Caddyfile the
+// operator has taken over with BOOTSTRAP_CADDYFILE_REPLAN=0, which is said
+// once, here, instead of on every apply.
+func caddyReplanner(sm *settings.Manager, cfg *config.Manager, panelPort int, stubRoot string) func() error {
+	if bootstrap.ReplanDisabled() {
+		if s := sm.Get().Server; s.Bootstrapped && s.Caddyfile != "" {
+			log.Printf("BOOTSTRAP_CADDYFILE_REPLAN is off: %s is left as it is, and changes to the domain, the panel gate or the web front will not reach dest until it is edited by hand.", s.Caddyfile)
+		}
+		return func() error { return nil }
+	}
+
+	var mu sync.Mutex
+	return func() error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		all := sm.Get()
+		if !all.Server.Bootstrapped || all.Server.Caddyfile == "" {
+			return nil
+		}
+		in := bootstrap.Install{
+			Domain:       all.Server.PublicHost,
+			Dest:         all.Server.Dest,
+			PanelPath:    all.Server.PanelPath,
+			Caddyfile:    all.Server.Caddyfile,
+			StubRoot:     stubRoot,
+			ACMEEmail:    all.Network.ACMEEmail,
+			FrontPort:    all.Server.FrontPort,
+			PanelPort:    panelPort,
+			WebFrontPort: panelPortOf(all.Mtproto.WebListen),
+		}
+		active := cfg.GetActive()
+		p, err := bootstrap.CaddyParamsFromInstall(in, active)
+		if errors.Is(err, bootstrap.ErrReplanSkipped) {
+			log.Printf("Caddyfile re-plan skipped, %s left as it is: %v", in.Caddyfile, err)
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		// Reality's stolen name is the operator's to change in the sing-box
+		// config; a domain that moved without it makes the front relay a name
+		// dest no longer has a certificate for.
+		if name := bootstrap.RealityServerName(active); name != "" && name != in.Domain {
+			log.Printf("WARNING: the vless-reality inbound steals %q but dest is planned for %q: update the inbound's server_name, or the front relays a name dest has no certificate for.", name, in.Domain)
+		}
+		changed, err := bootstrap.SyncCaddyfile(p, in.Caddyfile)
+		if err != nil {
+			return err
+		}
+		if changed {
+			log.Printf("Caddyfile %s re-planned from the current settings", in.Caddyfile)
+		}
+		return nil
+	}
 }
 
 // panelURL is the one place the secret address is spelled, so the banner and the

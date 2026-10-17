@@ -44,6 +44,7 @@ import (
 	"routebox/backend/internal/users"
 	"routebox/backend/internal/util"
 	"routebox/backend/internal/v2stats"
+	"routebox/backend/internal/webfront"
 )
 
 // Version is stamped at build time via -ldflags "-X main.Version=…".
@@ -645,6 +646,58 @@ func main() {
 	mtprotoMgr := mtproto.NewManager(mtprotoStore)
 	apiHandler.SetMtproto(mtprotoMgr)
 
+	// The loopback web front (vps mode): the plain-HTTP server behind dest, or
+	// behind the operator's own proxy, that serves the stub site and — while the
+	// Telegram WEB proxy is on — the mtg handler in its place. Created whether
+	// or not it listens, so the mtproto settings handler can start it later
+	// without a restart.
+	var front *webfront.Front
+	if effectiveMode == "vps" {
+		s := settingsMgr.Get()
+		stubRoot := stubRootOf(settingsMgr.GetPath(), resolvedConfigPath)
+		// The same directory MtprotoConfig hands the WEB proxy as its Public
+		// site, so strangers see one site whether or not the feature is on.
+		stubDir := s.Mtproto.WebPublicDir
+		if s.Server.Bootstrapped {
+			stubDir = stubRoot
+		}
+		front = webfront.New(webfront.NewStub(stubDir))
+		mtprotoMgr.SetWebFront(front)
+		apiHandler.SetWebFront(front)
+		apiHandler.SetStubRoot(stubRoot)
+
+		if s.Server.Bootstrapped {
+			replan := caddyReplanner(settingsMgr, cfgMgr, panelPortOf(resolvedListenAddr), stubRoot)
+			apiHandler.SetCaddyReplan(replan)
+			// Always on here: dest hands every request it does not route
+			// elsewhere to the front, so without it strangers get dest's error
+			// page instead of the stub site — the one thing this layout exists
+			// to keep looking ordinary.
+			if err := front.Start(s.Mtproto.WebListen); err != nil {
+				log.Fatalf("the web front cannot listen on %s (mtproto.web_listen), and dest's catch-all points at it: %v", s.Mtproto.WebListen, err)
+			}
+			// Only now: a Caddyfile re-planned to route to the front before the
+			// front listens would answer strangers with an error until it did.
+			// Not fatal — the file on disk keeps serving.
+			if err := replan(); err != nil {
+				log.Printf("WARNING: cannot re-plan dest's Caddyfile: %v", err)
+			}
+			// Fake TLS and dest on one port is a fight one of them loses at
+			// bind time, and which one depends on start order.
+			if _, mtPort, err := net.SplitHostPort(s.Mtproto.Listen); err == nil {
+				if _, destPort, err := net.SplitHostPort(s.Server.Dest); err == nil && mtPort == destPort {
+					log.Printf("WARNING: the Telegram proxy (mtproto.listen %s) and dest (%s) share port %s: one of them will fail to bind. Move mtproto.listen.", s.Mtproto.Listen, s.Server.Dest, mtPort)
+				}
+			}
+		} else if s.Mtproto.WebEnabled {
+			// Not fatal: the panel has to come up for the operator to fix the
+			// address, and turning the feature off and on again retries it.
+			if err := front.Start(s.Mtproto.WebListen); err != nil {
+				log.Printf("WARNING: the web front for the Telegram WEB proxy did not start: %v", err)
+			}
+		}
+	}
+
 	// One row shape for every consumer of traffic (#109). The live sampler
 	// behind /api/consumers/live only runs while the monitor page polls it.
 	// Panel users and the Telegram proxy are vps-mode features (their Manage
@@ -671,19 +724,6 @@ func main() {
 		},
 	})
 
-	mtprotoConfig := func() mtproto.Config {
-		s := settingsMgr.Get().Mtproto
-		return mtproto.Config{
-			Listen:             s.Listen,
-			MaskingDomain:      s.MaskingDomain,
-			Concurrency:        uint(s.Concurrency),
-			IdleTimeout:        time.Duration(s.IdleTimeoutSec) * time.Second,
-			PreferIP:           s.PreferIP,
-			DomainFrontingPort: uint(s.DomainFrontingPort),
-			SocksProxy:         mtproto.SocksProxyAddr(s.Outbound, s.SocksPort),
-		}
-	}
-
 	// Reconcile the managed SOCKS inbound before anything uses it. Ahead of the
 	// amnezia-box auto-start below, so the process comes up on the synced config
 	// rather than needing a reload it has not been asked for yet.
@@ -692,7 +732,7 @@ func main() {
 	if effectiveMode == "vps" && settingsMgr.Get().Mtproto.Enabled {
 		// Not fatal: the panel has to come up for an operator to fix whatever
 		// setting caused this — a busy port or a roster emptied by expiry.
-		if err := mtprotoMgr.Start(mtprotoConfig()); err != nil {
+		if err := mtprotoMgr.Start(apiHandler.MtprotoConfig()); err != nil {
 			log.Printf("WARNING: the Telegram proxy did not start: %v", err)
 		}
 	}
@@ -1284,6 +1324,13 @@ func main() {
 	// store it writes to safe to close.
 	if err := mtprotoMgr.Stop(); err != nil {
 		log.Printf("mtproto: stop: %v", err)
+	}
+	// After the proxy: stopping it hands the front back to the stub, and the
+	// WEB sessions it drains are relayed through this listener until then.
+	if front != nil {
+		if err := front.Stop(); err != nil {
+			log.Printf("webfront: stop: %v", err)
+		}
 	}
 	close(stopMtproto)
 	<-mtprotoFlushDone
