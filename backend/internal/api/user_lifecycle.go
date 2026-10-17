@@ -65,7 +65,7 @@ func (h *Handler) syncRejectRule() (deferred string, err error) {
 	// dest never sees that rule. Change-gated inside, so an unchanged list costs
 	// nothing.
 	if err := h.syncDest(); err != nil {
-		log.Printf("dest: naive user sync failed: %v", err)
+		log.Printf("dest: sync failed: %v", err)
 		return deferred, err
 	}
 	return deferred, nil

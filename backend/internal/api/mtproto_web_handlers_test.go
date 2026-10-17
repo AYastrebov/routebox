@@ -365,7 +365,7 @@ func TestLinkWebProxyWithoutAMaskingDomain(t *testing.T) {
 func TestSyncDestReplansBeforeNaive(t *testing.T) {
 	dest := &destStub{}
 	dest.start(t)
-	h, _, _, _ := destInstall(t, oneUser)
+	h, _, um, caddyfile := destInstall(t, oneUser)
 
 	calls := 0
 	h.SetCaddyReplan(func() error {
@@ -385,9 +385,44 @@ func TestSyncDestReplansBeforeNaive(t *testing.T) {
 	boom := errors.New("boom")
 	h.SetCaddyReplan(func() error { return boom })
 
+	// A failing re-plan must not cost the naive sync: disabling a user is
+	// what takes their naive access away, whatever the Caddyfile's state.
+	for _, u := range um.List() {
+		u.Enabled = false
+		if err := um.Put(&u); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	err := h.syncDest()
 	if !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), "caddyfile: ") {
 		t.Errorf("err = %v, want the replan error wrapped as caddyfile: ...", err)
+	}
+
+	if got := naiveList(t, caddyfile); strings.Contains(got, "alice") {
+		t.Errorf("a failing re-plan skipped the naive sync; the disabled user keeps access:\n%s", got)
+	}
+
+	if w := destSyncWarning(err); !strings.Contains(w, "Caddyfile could not be re-planned") || strings.Contains(w, "user list did not reach dest") {
+		t.Errorf("warning = %q, want it to name the Caddyfile re-plan and only that", w)
+	}
+
+	// Both halves failing comes back as both.
+	dest.fail = true
+	for _, u := range um.List() {
+		u.Enabled = true
+		if err := um.Put(&u); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = h.syncDest()
+	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "dest says no") {
+		t.Errorf("err = %v, want both the replan and the naive reload errors", err)
+	}
+
+	if w := destSyncWarning(err); !strings.Contains(w, "Caddyfile") || !strings.Contains(w, "user list did not reach dest") {
+		t.Errorf("warning = %q, want it to name both halves", w)
 	}
 }
 
