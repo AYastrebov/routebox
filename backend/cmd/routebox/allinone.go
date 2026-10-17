@@ -45,6 +45,7 @@ const (
 	destPort     = 9443 // loopback: Caddy — stub site, panel, naive
 	grpcPort     = 9444 // loopback: vless + grpc, behind dest
 	trojanWSPort = 9445 // loopback: trojan + ws, behind dest
+	webFrontPort = 9446 // loopback: RouteBox's web front — stub site and Telegram WEB proxy, behind dest
 )
 
 // bootstrapUser is the name every inbound's single user carries. PanelUser is
@@ -235,7 +236,7 @@ func plannedParams(a allInOne) (bootstrap.Params, error) {
 		Reality: bootstrap.Reality{PrivateKey: realityKey, ShortID: tokens[0][:8]},
 		Ports: bootstrap.Ports{
 			Front: frontPort, Mieru: mieruPort,
-			VlessGRPC: grpcPort, TrojanWS: trojanWSPort, Panel: a.PanelPort,
+			VlessGRPC: grpcPort, TrojanWS: trojanWSPort, Panel: a.PanelPort, WebFront: webFrontPort,
 		},
 		Paths: bootstrap.Paths{
 			VlessGRPC: "grpc-" + tokens[1],
