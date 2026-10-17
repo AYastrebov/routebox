@@ -653,6 +653,11 @@ func main() {
 	// without a restart.
 	var front *webfront.Front
 	if effectiveMode == "vps" {
+		// Ahead of everything below that reads the Telegram proxy's keys: the
+		// port-collision check, the Caddyfile re-plan and the proxy auto-start.
+		if err := migrateBootstrapMtproto(settingsMgr); err != nil {
+			log.Printf("WARNING: %v", err)
+		}
 		s := settingsMgr.Get()
 		stubRoot := stubRootOf(settingsMgr.GetPath(), resolvedConfigPath)
 		// The same directory MtprotoConfig hands the WEB proxy as its Public
@@ -673,15 +678,7 @@ func main() {
 			// elsewhere to the front, so without it strangers get dest's error
 			// page instead of the stub site — the one thing this layout exists
 			// to keep looking ordinary.
-			if err := front.Start(s.Mtproto.WebListen); err != nil {
-				log.Fatalf("the web front cannot listen on %s (mtproto.web_listen), and dest's catch-all points at it: %v", s.Mtproto.WebListen, err)
-			}
-			// Only now: a Caddyfile re-planned to route to the front before the
-			// front listens would answer strangers with an error until it did.
-			// Not fatal — the file on disk keeps serving.
-			if err := replan(); err != nil {
-				log.Printf("WARNING: cannot re-plan dest's Caddyfile: %v", err)
-			}
+			startBootstrapFront(front, s.Mtproto.WebListen, replan)
 			// Fake TLS and dest on one port is a fight one of them loses at
 			// bind time, and which one depends on start order.
 			if _, mtPort, err := net.SplitHostPort(s.Mtproto.Listen); err == nil {
@@ -1319,14 +1316,17 @@ func main() {
 	close(stopExpiry)
 	close(stopAwgSweep)
 	close(stopASN)
-	// The proxy stops first so no further traffic events arrive, then the loop
-	// is told to make its final flush, and only once that has returned is the
-	// store it writes to safe to close.
+	// The Telegram proxy stops first so no further traffic events arrive, then
+	// the loop is told to make its final flush, and only once that has returned
+	// is the store it writes to safe to close. mtprotoMgr.Stop itself goes in
+	// two steps: it reverts the front to the stub and drains the WEB handler,
+	// then shuts the Fake TLS proxy down.
 	if err := mtprotoMgr.Stop(); err != nil {
 		log.Printf("mtproto: stop: %v", err)
 	}
-	// After the proxy: stopping it hands the front back to the stub, and the
-	// WEB sessions it drains are relayed through this listener until then.
+	// The front server last: the WEB sessions drained above arrive through this
+	// listener, so it has to stay open until the drain is over. By now it only
+	// serves the stub site.
 	if front != nil {
 		if err := front.Stop(); err != nil {
 			log.Printf("webfront: stop: %v", err)

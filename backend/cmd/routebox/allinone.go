@@ -21,6 +21,7 @@ import (
 	"routebox/backend/internal/bootstrap"
 	"routebox/backend/internal/config"
 	"routebox/backend/internal/settings"
+	"routebox/backend/internal/webfront"
 )
 
 // allInOneEnv turns the out-of-the-box bootstrap on. It is a deliberate opt-in
@@ -51,6 +52,11 @@ const (
 	trojanWSPort = 9445 // loopback: trojan + ws, behind dest
 	webFrontPort = 9446 // loopback: RouteBox's web front — stub site and Telegram WEB proxy, behind dest
 )
+
+// bootstrapMtprotoListen is where the Telegram proxy's Fake TLS listens in the
+// out-of-the-box layout: off its default 9443, which is dest's loopback port
+// here, so the two do not fight over it.
+const bootstrapMtprotoListen = "0.0.0.0:9447"
 
 // bootstrapUser is the name every inbound's single user carries. PanelUser is
 // derived from inbound.users[] by name, so one shared name means the panel shows
@@ -205,7 +211,7 @@ func runAllInOne(sm *settings.Manager, a allInOne, out io.Writer) error {
 	if err := sm.Update(map[string]interface{}{
 		"mtproto.web_enabled":    true,
 		"mtproto.masking_domain": a.Domain,
-		"mtproto.listen":         "0.0.0.0:9447",
+		"mtproto.listen":         bootstrapMtprotoListen,
 	}); err != nil {
 		return fmt.Errorf("turn the Telegram WEB proxy on: %w", err)
 	}
@@ -224,6 +230,76 @@ func runAllInOne(sm *settings.Manager, a allInOne, out io.Writer) error {
 	fmt.Fprintln(out, " `routebox panel-url` prints this address again.")
 	fmt.Fprintln(out, "==================================================================")
 	return nil
+}
+
+// migrateBootstrapMtproto brings an all-in-one install that predates the
+// Telegram WEB proxy up to the keys runAllInOne writes on a fresh one. Those
+// installs were bootstrapped once and never are again, so without this they
+// keep Fake TLS on dest's own port and no masking domain, and the WEB proxy
+// fails the moment the operator turns it on — while the panel, which treats
+// both keys as managed on this layout, offers nothing to fix.
+//
+// Two keys, each moved only when it is in the state that cannot work: a Fake
+// TLS port equal to dest's, and an empty masking domain. Anything else is the
+// operator's choice and stays. web_enabled is deliberately not touched: an
+// upgrade must not switch a feature on that the operator never asked for, so
+// they opt in with the panel toggle. One save for both, and a log line each,
+// so the change is not silent.
+//
+// Runs on every boot and is a no-op once the keys are right, which makes it
+// one-time in effect without a marker of its own.
+func migrateBootstrapMtproto(sm *settings.Manager) error {
+	s := sm.Get()
+	if !s.Server.Bootstrapped {
+		return nil
+	}
+
+	updates := map[string]interface{}{}
+	if _, mtPort, err := net.SplitHostPort(s.Mtproto.Listen); err == nil {
+		if _, destPort, err := net.SplitHostPort(s.Server.Dest); err == nil && mtPort == destPort {
+			updates["mtproto.listen"] = bootstrapMtprotoListen
+			log.Printf("mtproto.listen %s shares port %s with dest (%s); moving it to %s", s.Mtproto.Listen, mtPort, s.Server.Dest, bootstrapMtprotoListen)
+		}
+	}
+	if s.Mtproto.MaskingDomain == "" && s.Server.PublicHost != "" {
+		updates["mtproto.masking_domain"] = s.Server.PublicHost
+		log.Printf("mtproto.masking_domain is empty; setting it to server.public_host %s", s.Server.PublicHost)
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	if err := sm.Update(updates); err != nil {
+		return fmt.Errorf("migrate the Telegram proxy settings: %w", err)
+	}
+	if err := sm.Save(); err != nil {
+		return fmt.Errorf("save the migrated Telegram proxy settings: %w", err)
+	}
+	return nil
+}
+
+// startBootstrapFront brings the web front up on a bootstrapped install, then
+// re-plans dest's Caddyfile to point at it.
+//
+// A bind failure is logged, not fatal: this process also runs amnezia-box,
+// the VPN and the panel, and crashing all of them in a restart loop over one
+// busy loopback port would take down far more than the stub site. The re-plan
+// is skipped in that case, so the Caddyfile is not moved to a front that is
+// not listening: the one already on disk keeps pointing at the old address,
+// and a planned Caddyfile answers with its handle_errors stub when the front
+// is down. The operator fixes mtproto.web_listen in the panel, whose PUT
+// retries the bind.
+func startBootstrapFront(front *webfront.Front, listen string, replan func() error) {
+	if err := front.Start(listen); err != nil {
+		log.Printf("WARNING: the web front cannot listen on %s (mtproto.web_listen), and dest's catch-all points at it; strangers get dest's fallback page until mtproto.web_listen is fixed in the panel. The Caddyfile is not re-planned: %v", listen, err)
+		return
+	}
+	// Only now: a Caddyfile re-planned to route to the front before the front
+	// listens would answer strangers with an error until it did. Not fatal —
+	// the file on disk keeps serving.
+	if err := replan(); err != nil {
+		log.Printf("WARNING: cannot re-plan dest's Caddyfile: %v", err)
+	}
 }
 
 // caddyReplanner returns the one function that keeps a bootstrapped install's
