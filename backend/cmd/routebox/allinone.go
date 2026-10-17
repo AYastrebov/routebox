@@ -240,12 +240,19 @@ func runAllInOne(sm *settings.Manager, a allInOne, out io.Writer) error {
 // fails the moment the operator turns it on — while the panel, which treats
 // both keys as managed on this layout, offers nothing to fix.
 //
-// Two keys, each moved only when it is in the state that cannot work: a Fake
-// TLS port equal to dest's, and an empty masking domain. Anything else is the
-// operator's choice and stays. web_enabled is deliberately not touched: an
-// upgrade must not switch a feature on that the operator never asked for, so
-// they opt in with the panel toggle. One save for both, and a log line each,
-// so the change is not silent.
+// Three keys, each moved only when it is in the state that cannot work: a Fake
+// TLS port equal to dest's, an empty masking domain, and a web_listen host the
+// Caddyfile cannot reach (it dials the front at 127.0.0.1:<port>, so a front
+// on any other host than 127.0.0.1 or a wildcard is unreachable; the host
+// moves to 127.0.0.1 and the port stays). Anything else is the operator's
+// choice and stays. web_enabled is deliberately not touched: an upgrade must
+// not switch a feature on that the operator never asked for, so they opt in
+// with the panel toggle. One save for all, and a log line each, so the change
+// is not silent.
+//
+// The web_listen move is also what makes the panel's loopback check on that
+// key safe to roll back to: after boot, the value a failed save restores is
+// one the check accepts.
 //
 // Runs on every boot and is a no-op once the keys are right, which makes it
 // one-time in effect without a marker of its own.
@@ -261,6 +268,11 @@ func migrateBootstrapMtproto(sm *settings.Manager) error {
 			updates["mtproto.listen"] = bootstrapMtprotoListen
 			log.Printf("mtproto.listen %s shares port %s with dest (%s); moving it to %s", s.Mtproto.Listen, mtPort, s.Server.Dest, bootstrapMtprotoListen)
 		}
+	}
+	if host, port, err := net.SplitHostPort(s.Mtproto.WebListen); err == nil && !settings.WebListenReachesLoopback(host) {
+		moved := net.JoinHostPort("127.0.0.1", port)
+		updates["mtproto.web_listen"] = moved
+		log.Printf("mtproto.web_listen %s is on a host dest's Caddyfile cannot reach (it dials 127.0.0.1:%s); moving it to %s", s.Mtproto.WebListen, port, moved)
 	}
 	if s.Mtproto.MaskingDomain == "" && s.Server.PublicHost != "" {
 		updates["mtproto.masking_domain"] = s.Server.PublicHost

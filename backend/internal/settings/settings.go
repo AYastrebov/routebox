@@ -751,6 +751,17 @@ func validateLoopbackAddr(addr string) error {
 	return nil
 }
 
+// WebListenReachesLoopback reports whether a front bound to host (as
+// net.SplitHostPort returns it) answers on 127.0.0.1, which is where a
+// bootstrapped install's Caddyfile dials it: 127.0.0.1 itself, or a wildcard.
+func WebListenReachesLoopback(host string) bool {
+	switch host {
+	case "", "127.0.0.1", "0.0.0.0", "::":
+		return true
+	}
+	return false
+}
+
 func isPlausibleHostname(s string) bool {
 	if len(s) > 253 {
 		return false
@@ -1177,12 +1188,14 @@ func (m *Manager) Update(updates map[string]interface{}) error {
 			}
 			// A bootstrapped install's Caddyfile dials the front at
 			// 127.0.0.1:<port> whatever host this names, so a front bound
-			// anywhere else would be one dest cannot reach. Only a change is
-			// checked, so an older file that says otherwise still loads and
-			// can be rolled back to.
-			if staged.Server.Bootstrapped && v != staged.Mtproto.WebListen &&
-				host != "" && host != "127.0.0.1" && host != "0.0.0.0" {
-				return fmt.Errorf("setting %s: on an all-in-one install dest reaches the web front at 127.0.0.1:%s, so the host must be 127.0.0.1 (or empty or 0.0.0.0, which include it), not %q", key, portStr, host)
+			// anywhere else would be one dest cannot reach. The wildcards
+			// include 127.0.0.1 ([::] too, on Linux's dual-stack binds). A
+			// file that names another host is moved to 127.0.0.1 at boot
+			// (migrateBootstrapMtproto), so the value a failed save rolls back
+			// to always passes; the unchanged value is let through anyway, so
+			// a PUT echoing it back is never refused over it.
+			if staged.Server.Bootstrapped && v != staged.Mtproto.WebListen && !WebListenReachesLoopback(host) {
+				return fmt.Errorf("setting %s: on an all-in-one install dest reaches the web front at 127.0.0.1:%s, so the host must be 127.0.0.1 (or empty, 0.0.0.0 or [::], which include it), not %q", key, portStr, host)
 			}
 			staged.Mtproto.WebListen = v
 		case "mtproto.web_public_dir":

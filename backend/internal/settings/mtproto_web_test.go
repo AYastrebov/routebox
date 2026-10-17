@@ -102,14 +102,15 @@ func TestMtprotoWebListenOnABootstrappedInstallMustIncludeLoopback(t *testing.T)
 			t.Errorf("%q: err = %v, want a refusal naming 127.0.0.1", bad, err)
 		}
 	}
-	for _, good := range []string{"127.0.0.1:9500", ":9501", "0.0.0.0:9502"} {
+	for _, good := range []string{"127.0.0.1:9500", ":9501", "0.0.0.0:9502", "[::]:9503"} {
 		if err := m.Update(map[string]any{"mtproto.web_listen": good}); err != nil {
 			t.Errorf("%q rejected: %v", good, err)
 		}
 	}
 
-	// Only a change is checked: an older file that names another host still
-	// loads, and a rollback to that value still goes through.
+	// A PUT echoing the current value back is not refused over it. (Boot's
+	// migrateBootstrapMtproto moves such a value to 127.0.0.1, so it is not
+	// the current one on a running install.)
 	m.settings.Mtproto.WebListen = "[::1]:9446"
 	if err := m.Update(map[string]any{"mtproto.web_listen": "[::1]:9446"}); err != nil {
 		t.Errorf("the unchanged value was refused: %v", err)

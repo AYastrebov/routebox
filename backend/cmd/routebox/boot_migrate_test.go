@@ -67,6 +67,49 @@ func TestMigrateBootstrapMtprotoKeepsTheOperatorsChoices(t *testing.T) {
 	}
 }
 
+// dest dials the front at 127.0.0.1:<port>, so a web_listen on another host
+// (hand-edited, or set before the panel checked it) is moved there, port kept;
+// one dest can reach, a wildcard included, stays.
+func TestMigrateBootstrapMtprotoMovesAnUnreachableWebListen(t *testing.T) {
+	for listen, want := range map[string]string{
+		"10.0.0.5:9555":  "127.0.0.1:9555",
+		"[::1]:9556":     "127.0.0.1:9556",
+		"localhost:9557": "127.0.0.1:9557",
+		"127.0.0.1:9558": "127.0.0.1:9558",
+		"0.0.0.0:9559":   "0.0.0.0:9559",
+		"[::]:9560":      "[::]:9560",
+		":9561":          ":9561",
+	} {
+		sm := newVPSSettings(t, t.TempDir())
+		// Before SetBootstrap: the panel would refuse it afterwards.
+		if err := sm.Update(map[string]interface{}{
+			"server.public_host": "media.example.com",
+			"mtproto.web_listen": listen,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := sm.SetBootstrap("/panel-secret", "127.0.0.1:9443", filepath.Join(t.TempDir(), "Caddyfile"), 443); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := migrateBootstrapMtproto(sm); err != nil {
+			t.Fatalf("%s: migrate: %v", listen, err)
+		}
+
+		if got := newVPSSettings(t, filepath.Dir(sm.GetPath())).Get().Mtproto.WebListen; got != want {
+			t.Errorf("%s: web_listen = %q after a restart, want %q", listen, got, want)
+		}
+
+		// And what is there now is a value a failed save can roll back to.
+		if err := sm.Update(map[string]interface{}{"mtproto.web_listen": "127.0.0.1:9600"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := sm.Update(map[string]interface{}{"mtproto.web_listen": want}); err != nil {
+			t.Errorf("%s: rolling back to %q was refused: %v", listen, want, err)
+		}
+	}
+}
+
 // Every other install has no dest to collide with and no domain of ours.
 func TestMigrateBootstrapMtprotoLeavesOtherInstallsAlone(t *testing.T) {
 	sm := newVPSSettings(t, t.TempDir())
