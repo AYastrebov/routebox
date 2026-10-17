@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { t } from 'svelte-i18n';
-	import type { MtprotoSettings, RoutableTag } from '$lib/types';
+	import type { MtprotoSettings, MtprotoWeb, RoutableTag } from '$lib/types';
 	import { configReadOnly } from '$lib/stores';
 	import { splitListen, joinListen } from './listenAddr';
+	import { nginxSnippet, caddySnippet } from './webSnippet';
 
 	interface Props {
 		form: MtprotoSettings;
@@ -11,6 +12,8 @@
 		savedDomain: string;
 		/** Outbounds and endpoints Telegram traffic can be routed through. */
 		outbounds?: RoutableTag[];
+		/** WEB proxy state; `managed` decides whether the operator wires a reverse proxy. */
+		web: MtprotoWeb;
 		saving?: boolean;
 		/** Form differs from the saved settings — enables the buttons. */
 		dirty?: boolean;
@@ -22,11 +25,17 @@
 		form = $bindable(),
 		savedDomain,
 		outbounds = [],
+		web,
 		saving = false,
 		dirty = true,
 		onSave,
 		onReset
 	}: Props = $props();
+
+	// What the snippets show: the typed values, so they follow the form as the
+	// operator edits rather than the last save.
+	const snippetHost = $derived(form.web_hostname.trim() || 'proxy.example.com');
+	const snippetListen = $derived(form.web_listen.trim() || '127.0.0.1:9446');
 
 	// Only warn when the domain is genuinely being changed, and only when there
 	// was one to invalidate — on first setup there are no links out yet.
@@ -215,6 +224,51 @@
 	</div>
 </section>
 
+<section class="group">
+	<h4 class="group-title">{$t('telegram.groupWeb')}</h4>
+	<div class="field-grid">
+		<div class="field wide">
+			<label class="check" for="mt-web-enabled">
+				<input id="mt-web-enabled" type="checkbox" bind:checked={form.web_enabled} />
+				{$t('telegram.webEnabled')}
+			</label>
+			<span class="hint">{$t('telegram.webEnabledHint')}</span>
+		</div>
+		{#if web.managed}
+			<p class="group-note wide">{$t('telegram.webManagedNote', { values: { domain: web.hostname } })}</p>
+		{:else}
+			<div class="field">
+				<label for="mt-web-host">{$t('telegram.webHostname')}</label>
+				<input id="mt-web-host" type="text" bind:value={form.web_hostname} placeholder="proxy.example.com" />
+				<span class="hint">{$t('telegram.webHostnameHint')}</span>
+			</div>
+			<div class="field">
+				<label for="mt-web-listen">{$t('telegram.webListen')}</label>
+				<input id="mt-web-listen" type="text" bind:value={form.web_listen} placeholder="127.0.0.1:9446" />
+				<span class="hint">{$t('telegram.webListenHint')}</span>
+			</div>
+			<div class="field wide">
+				<label for="mt-web-dir">{$t('telegram.webPublicDir')}</label>
+				<input id="mt-web-dir" type="text" bind:value={form.web_public_dir} />
+				<span class="hint">{$t('telegram.webPublicDirHint')}</span>
+			</div>
+		{/if}
+	</div>
+	{#if !web.managed}
+		<details class="snippets">
+			<summary>{$t('telegram.webSnippetTitle')}</summary>
+			<div class="field">
+				<label for="mt-web-nginx">{$t('telegram.webSnippetNginx')}</label>
+				<textarea id="mt-web-nginx" class="snippet" rows="14" readonly value={nginxSnippet(snippetHost, snippetListen)}></textarea>
+			</div>
+			<div class="field">
+				<label for="mt-web-caddy">{$t('telegram.webSnippetCaddy')}</label>
+				<textarea id="mt-web-caddy" class="snippet" rows="3" readonly value={caddySnippet(snippetHost, snippetListen)}></textarea>
+			</div>
+		</details>
+	{/if}
+</section>
+
 {#if missingOutbound}
 	<div class="domain-warn">
 		<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" /></svg>
@@ -319,6 +373,36 @@
 		grid-column: 1 / -1;
 		font-size: 0.75rem;
 		color: var(--ctp-overlay0);
+	}
+	.wide {
+		grid-column: 1 / -1;
+	}
+	.field .check {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+	.snippets {
+		margin-top: 1rem;
+	}
+	.snippets summary {
+		cursor: pointer;
+		font-size: 0.8125rem;
+		color: var(--ctp-subtext1);
+	}
+	.snippets .field {
+		margin-top: 0.75rem;
+	}
+	.snippet {
+		width: 100%;
+		padding: 0.5rem;
+		border-radius: 0.375rem;
+		border: 1px solid var(--ctp-surface2);
+		background: var(--ctp-mantle);
+		color: var(--ctp-text);
+		font-family: ui-monospace, monospace;
+		font-size: 0.75rem;
+		resize: vertical;
 	}
 	.field input:focus,
 	.field select:focus {

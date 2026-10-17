@@ -20,6 +20,8 @@
 
 	const running = $derived(!!proxy?.status.running);
 	const canShare = $derived(!!proxy?.can_issue_link);
+	// Either link is worth handing out: the WEB proxy one needs no Fake TLS port.
+	const canShareWeb = $derived(!!proxy?.web.can_issue_link);
 	const readOnly = $derived(!!proxy?.read_only);
 	const formDirty = $derived(
 		!!form && !!proxy && JSON.stringify(form) !== JSON.stringify(proxy.settings)
@@ -110,7 +112,7 @@
 		if (!form) return;
 		saving = true;
 		try {
-			await api.updateMtprotoSettings({
+			const saved = await api.updateMtprotoSettings({
 				listen: form.listen,
 				masking_domain: form.masking_domain.trim(),
 				public_host: form.public_host.trim(),
@@ -120,9 +122,15 @@
 				prefer_ip: form.prefer_ip,
 				domain_fronting_port: form.domain_fronting_port,
 				outbound: form.outbound,
-				socks_port: form.socks_port
+				socks_port: form.socks_port,
+				web_enabled: form.web_enabled,
+				web_hostname: form.web_hostname.trim(),
+				web_listen: form.web_listen.trim(),
+				web_public_dir: form.web_public_dir.trim()
 			});
 			notifications.success($t('telegram.settingsSaved'));
+			// Saved, but something downstream (the dest Caddyfile) did not follow.
+			if (saved.warning) notifications.warning(saved.warning);
 			await refresh();
 			if (proxy) form = cloneSettings(proxy.settings);
 		} catch (e) {
@@ -195,6 +203,13 @@
 				</div>
 			{/if}
 
+			{#if running && proxy.web.enabled}
+				<div class="strip-metric">
+					<span class="m-val">{$t('telegram.webChip', { values: { n: proxy.web.sessions } })}</span>
+					<span class="m-key">{$t('telegram.groupWeb')}</span>
+				</div>
+			{/if}
+
 			<div class="strip-spacer"></div>
 
 			{#if running}
@@ -212,7 +227,7 @@
 
 		{#if !running && blockedReason}
 			<div class="note-line">{blockedReason}</div>
-		{:else if !canShare}
+		{:else if !canShare && !canShareWeb}
 			<div class="note-line">{$t('telegram.linkBlocked')}</div>
 		{/if}
 
@@ -225,7 +240,7 @@
 				</div>
 			</div>
 			<div class="clients-body">
-				<ClientRoster {clients} {canShare} {readOnly} onChange={refresh} />
+				<ClientRoster {clients} {canShare} {canShareWeb} webManaged={proxy.web.managed} fakeTlsPort={proxy.settings.listen.split(':').pop() ?? ''} {readOnly} onChange={refresh} />
 			</div>
 		</div>
 
@@ -259,6 +274,7 @@
 						bind:form
 						savedDomain={proxy.settings.masking_domain}
 						outbounds={proxy.outbounds ?? []}
+						web={proxy.web}
 						{saving}
 						dirty={formDirty}
 						onSave={saveSettings}

@@ -15,11 +15,30 @@
 		 *  QR actions stay dead rather than handing out something that fails
 		 *  silently inside Telegram. */
 		canShare: boolean;
+		/** The WEB proxy link can be issued. Enables the share buttons on its own,
+		 *  since that link needs no masking domain. */
+		canShareWeb?: boolean;
+		/** All-in-one install: the Fake TLS port is not published, so the MTProto
+		 *  link is a fallback that will not connect from outside. */
+		webManaged?: boolean;
+		fakeTlsPort?: string;
 		readOnly?: boolean;
 		onChange: () => void | Promise<void>;
 	}
 
-	let { clients, canShare, readOnly = false, onChange }: Props = $props();
+	let {
+		clients,
+		canShare,
+		canShareWeb = false,
+		webManaged = false,
+		fakeTlsPort = '',
+		readOnly = false,
+		onChange
+	}: Props = $props();
+
+	const canShareAny = $derived(canShare || canShareWeb);
+	// Which message explains a dead button: the WEB link has its own missing piece.
+	const blockedTitle = $derived(canShareAny ? '' : $t('telegram.linkBlocked'));
 
 	let newName = $state('');
 	let adding = $state(false);
@@ -32,8 +51,11 @@
 	// Share modal state. The secret only ever lives here, for as long as the
 	// modal is open — it is fetched per share action, never with the roster.
 	let shareName = $state<string | null>(null);
-	let shareTg = $state('');
-	let shareWeb = $state('');
+	// Fake TLS links, absent when the masking domain / public host is missing.
+	let shareTg = $state<string | null>(null);
+	let shareWeb = $state<string | null>(null);
+	// tg://webproxy link of the WEB proxy, null when it cannot be issued.
+	let shareWebProxy = $state<string | null>(null);
 	let qrDataUrl = $state('');
 
 	function nowSec(): number {
@@ -121,11 +143,16 @@
 			const link = await api.getMtprotoClientLink(c.name);
 			shareTg = link.tg;
 			shareWeb = link.web;
+			shareWebProxy = link.webproxy?.tg ?? null;
 			// The tg:// form is what a phone should scan: it opens Telegram
-			// directly instead of a browser tab that then redirects.
-			qrDataUrl = withQr
-				? await QRCode.toDataURL(link.tg, { width: 512, margin: 2, errorCorrectionLevel: 'M' })
-				: '';
+			// directly instead of a browser tab that then redirects. On an
+			// all-in-one install the Fake TLS port is not published, so the WEB
+			// proxy link is the one worth scanning.
+			const qrSource = webManaged && link.webproxy ? link.webproxy.tg : (link.tg ?? link.webproxy?.tg ?? null);
+			qrDataUrl =
+				withQr && qrSource
+					? await QRCode.toDataURL(qrSource, { width: 512, margin: 2, errorCorrectionLevel: 'M' })
+					: '';
 			shareName = c.name;
 		} catch (e) {
 			notifications.error(`${$t('telegram.loadFailed')}: ${e}`);
@@ -134,8 +161,9 @@
 
 	function closeShare() {
 		shareName = null;
-		shareTg = '';
-		shareWeb = '';
+		shareTg = null;
+		shareWeb = null;
+		shareWebProxy = null;
 		qrDataUrl = '';
 	}
 
@@ -197,11 +225,11 @@
 					<button type="button" class="peer-btn" disabled={readOnly} onclick={() => openRenew(c)}>
 						{c.expires_at ? $t('telegram.renew') : $t('telegram.setExpiry')}
 					</button>
-					<button type="button" class="peer-btn primary" disabled={!canShare} title={canShare ? '' : $t('telegram.linkBlocked')} onclick={() => share(c, true)}>
+					<button type="button" class="peer-btn primary" disabled={!canShareAny} title={blockedTitle} onclick={() => share(c, true)}>
 						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><line x1="14" y1="14" x2="14" y2="21" /><line x1="21" y1="14" x2="21" y2="21" /><line x1="14" y1="17.5" x2="21" y2="17.5" /></svg>
 						{$t('telegram.qr')}
 					</button>
-					<button type="button" class="peer-btn" disabled={!canShare} title={canShare ? '' : $t('telegram.linkBlocked')} onclick={() => share(c, false)}>
+					<button type="button" class="peer-btn" disabled={!canShareAny} title={blockedTitle} onclick={() => share(c, false)}>
 						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></svg>
 						{$t('telegram.share')}
 					</button>
@@ -248,14 +276,36 @@
 			</div>
 		</div>
 		<div class="link-modal">
-			<div class="link-hint">tg://proxy</div>
-			<textarea class="link-text" rows="2" readonly value={shareTg}></textarea>
-			<div class="link-hint">https://t.me/proxy</div>
-			<textarea class="link-text" rows="2" readonly value={shareWeb}></textarea>
+			{#if shareWebProxy}
+				<div class="link-head">
+					<span class="link-title">{$t('telegram.webLink')}</span>
+					<button type="button" class="btn-ghost-sm" onclick={() => copy(shareWebProxy ?? '')}>{$t('telegram.copyLink')}</button>
+				</div>
+				<div class="link-hint">tg://webproxy</div>
+				<textarea class="link-text" rows="2" readonly value={shareWebProxy}></textarea>
+			{/if}
+			{#if shareTg || shareWeb}
+				<div class="link-head">
+					<span class="link-title">{$t('telegram.mtprotoLink')}</span>
+					{#if shareTg}
+						<button type="button" class="btn-ghost-sm" onclick={() => copy(shareTg ?? '')}>{$t('telegram.copyLink')}</button>
+					{/if}
+				</div>
+				{#if webManaged}
+					<div class="link-hint">{$t('telegram.fakeTlsUnpublished', { values: { port: fakeTlsPort } })}</div>
+				{/if}
+				{#if shareTg}
+					<div class="link-hint">tg://proxy</div>
+					<textarea class="link-text" rows="2" readonly value={shareTg}></textarea>
+				{/if}
+				{#if shareWeb}
+					<div class="link-hint">https://t.me/proxy</div>
+					<textarea class="link-text" rows="2" readonly value={shareWeb}></textarea>
+				{/if}
+			{/if}
 		</div>
 		{#snippet footer()}
 			<div class="modal-foot">
-				<button type="button" class="btn-ghost-sm" onclick={() => copy(shareTg)}>{$t('telegram.copyLink')}</button>
 				<button type="button" class="btn-ghost-sm" onclick={closeShare}>{$t('telegram.cancel')}</button>
 			</div>
 		{/snippet}
@@ -539,6 +589,17 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.4rem;
+	}
+	.link-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem;
+		margin-top: 0.4rem;
+	}
+	.link-title {
+		font-weight: 600;
+		font-size: 0.875rem;
 	}
 	.link-hint {
 		font-size: 0.8rem;
