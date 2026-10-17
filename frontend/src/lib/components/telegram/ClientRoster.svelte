@@ -68,7 +68,9 @@
 	let shareWeb = $state<string | null>(null);
 	// tg://webproxy link of the WEB proxy, null when it cannot be issued.
 	let shareWebProxy = $state<string | null>(null);
-	let qrDataUrl = $state('');
+	// One QR per way in, rendered only for the QR button.
+	let qrWeb = $state('');
+	let qrTg = $state('');
 
 	function nowSec(): number {
 		return Math.floor(Date.now() / 1000);
@@ -156,15 +158,13 @@
 			shareTg = link.tg;
 			shareWeb = link.web;
 			shareWebProxy = link.webproxy?.tg ?? null;
-			// The tg:// form is what a phone should scan: it opens Telegram
-			// directly instead of a browser tab that then redirects. On an
-			// all-in-one install the Fake TLS port is not published, so the WEB
-			// proxy link is the one worth scanning.
-			const qrSource = webManaged && link.webproxy ? link.webproxy.tg : (link.tg ?? link.webproxy?.tg ?? null);
-			qrDataUrl =
-				withQr && qrSource
-					? await QRCode.toDataURL(qrSource, { width: 512, margin: 2, errorCorrectionLevel: 'M' })
-					: '';
+			// The tg:// forms are what a phone should scan: they open Telegram
+			// directly instead of a browser tab that then redirects. Each way in
+			// gets its own code, so the dialog never has to guess which one the
+			// person wants.
+			const qr = (v: string | null) =>
+				withQr && v ? QRCode.toDataURL(v, { width: 512, margin: 2, errorCorrectionLevel: 'M' }) : Promise.resolve('');
+			[qrWeb, qrTg] = await Promise.all([qr(shareWebProxy), qr(shareTg)]);
 			shareName = c.name;
 		} catch (e) {
 			notifications.error(`${$t('telegram.loadFailed')}: ${e}`);
@@ -176,7 +176,8 @@
 		shareTg = null;
 		shareWeb = null;
 		shareWebProxy = null;
-		qrDataUrl = '';
+		qrWeb = '';
+		qrTg = '';
 	}
 
 	async function copy(value: string) {
@@ -278,42 +279,41 @@
 
 {#if shareName}
 	<Modal open title={shareName} onClose={closeShare}>
-		<div class="qr-modal">
-			{#if qrDataUrl}
-				<img class="qr-img" src={qrDataUrl} alt={shareName} />
-			{/if}
-			<div class="qr-text">
-				<div class="qr-title">{$t('telegram.share')}</div>
-				<div class="qr-hint">{$t('telegram.maskingDomainWarning')}</div>
-			</div>
-		</div>
-		<div class="link-modal">
+		<!-- One block per way in. The WEB proxy comes first because it is the
+		     one that works wherever a browser works; on an all-in-one install it
+		     is also the only one that connects from outside. -->
+		<div class="share-grid">
 			{#if shareWebProxy}
-				<div class="link-head">
-					<span class="link-title">{$t('telegram.webLink')}</span>
+				<section class="share-block">
+					<h3>{$t('telegram.transportWeb')}</h3>
+					{#if qrWeb}
+						<img class="qr-img" src={qrWeb} alt="{shareName}: {$t('telegram.transportWeb')}" />
+					{/if}
+					<div class="link-hint">tg://webproxy</div>
+					<textarea class="link-text" rows="2" readonly value={shareWebProxy}></textarea>
 					<button type="button" class="btn-ghost-sm" onclick={() => copy(shareWebProxy ?? '')}>{$t('telegram.copyLink')}</button>
-				</div>
-				<div class="link-hint">tg://webproxy</div>
-				<textarea class="link-text" rows="2" readonly value={shareWebProxy}></textarea>
+				</section>
 			{/if}
 			{#if shareTg || shareWeb}
-				<div class="link-head">
-					<span class="link-title">{$t('telegram.mtprotoLink')}</span>
+				<section class="share-block" class:muted={webManaged}>
+					<h3>{$t('telegram.transportMtproto')}</h3>
+					{#if webManaged}
+						<p class="link-note">{$t('telegram.fakeTlsUnpublished', { values: { port: fakeTlsPort } })}</p>
+					{:else if qrTg}
+						<img class="qr-img" src={qrTg} alt="{shareName}: {$t('telegram.transportMtproto')}" />
+					{/if}
+					{#if shareTg}
+						<div class="link-hint">tg://proxy</div>
+						<textarea class="link-text" rows="2" readonly value={shareTg}></textarea>
+					{/if}
+					{#if shareWeb}
+						<div class="link-hint">https://t.me/proxy</div>
+						<textarea class="link-text" rows="2" readonly value={shareWeb}></textarea>
+					{/if}
 					{#if shareTg}
 						<button type="button" class="btn-ghost-sm" onclick={() => copy(shareTg ?? '')}>{$t('telegram.copyLink')}</button>
 					{/if}
-				</div>
-				{#if webManaged}
-					<div class="link-hint">{$t('telegram.fakeTlsUnpublished', { values: { port: fakeTlsPort } })}</div>
-				{/if}
-				{#if shareTg}
-					<div class="link-hint">tg://proxy</div>
-					<textarea class="link-text" rows="2" readonly value={shareTg}></textarea>
-				{/if}
-				{#if shareWeb}
-					<div class="link-hint">https://t.me/proxy</div>
-					<textarea class="link-text" rows="2" readonly value={shareWeb}></textarea>
-				{/if}
+				</section>
 			{/if}
 		</div>
 		{#snippet footer()}
@@ -568,50 +568,44 @@
 		display: block;
 		margin-bottom: 0.2rem;
 	}
-	.qr-modal {
-		display: flex;
+	.share-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
 		gap: 1.25rem;
-		align-items: flex-start;
-		flex-wrap: wrap;
-		margin-bottom: 1rem;
+	}
+	.share-block {
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+		min-width: 0;
+	}
+	.share-block h3 {
+		margin: 0 0 0.25rem;
+		font-size: 0.9375rem;
+		font-weight: 600;
+		color: var(--ctp-text);
+	}
+	/* The all-in-one note replaces its QR: a code nobody can connect with is
+	   worse than no code. */
+	.share-block.muted h3 {
+		color: var(--ctp-subtext1);
+	}
+	.share-block .btn-ghost-sm {
+		align-self: flex-start;
 	}
 	.qr-img {
 		border-radius: 0.5rem;
 		background: #fff;
-		padding: 0.75rem;
-		flex-shrink: 0;
+		padding: 0.6rem;
 		width: 100%;
-		max-width: 320px;
+		max-width: 240px;
 		height: auto;
 		image-rendering: pixelated;
 	}
-	.qr-text {
-		flex: 1;
-		min-width: 12rem;
-	}
-	.qr-title {
-		font-weight: 600;
-		margin-bottom: 0.25rem;
-	}
-	.qr-hint {
-		color: var(--ctp-overlay1);
+	.link-note {
+		margin: 0 0 0.25rem;
 		font-size: 0.8125rem;
-	}
-	.link-modal {
-		display: flex;
-		flex-direction: column;
-		gap: 0.4rem;
-	}
-	.link-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 0.5rem;
-		margin-top: 0.4rem;
-	}
-	.link-title {
-		font-weight: 600;
-		font-size: 0.875rem;
+		color: var(--ctp-overlay1);
 	}
 	.link-hint {
 		font-size: 0.8rem;

@@ -44,7 +44,7 @@ async function openShare(link: MtprotoLink, props: Record<string, unknown>, butt
 	render(ClientRoster, { props: { clients: [alice], canShare: true, onChange: () => {}, ...props } });
 	const btn = screen.getAllByRole('button').find((b) => b.textContent?.trim() === button)!;
 	await fireEvent.click(btn);
-	await vi.waitFor(() => expect(document.body.textContent).toContain(en.telegram.mtprotoLink));
+	await vi.waitFor(() => expect(document.body.textContent).toContain(en.telegram.transportMtproto));
 }
 
 // Spec §7.6: the share dialog carries the WEB proxy link when the server
@@ -52,13 +52,13 @@ async function openShare(link: MtprotoLink, props: Record<string, unknown>, butt
 describe('ClientRoster: share dialog', () => {
 	it('with a WEB proxy link: both sections, the webproxy link first', async () => {
 		await openShare({ ...fakeTls, webproxy }, { canShareWeb: true }, 'Link');
-		expect(document.body.textContent).toContain(en.telegram.webLink);
+		expect(document.body.textContent).toContain(en.telegram.transportWeb);
 		expect(textareas()).toEqual([webproxy.tg, fakeTls.tg, fakeTls.web]);
 	});
 
 	it('without one: no WEB proxy section', async () => {
 		await openShare({ ...fakeTls, webproxy: null }, {}, 'Link');
-		expect(document.body.textContent).not.toContain(en.telegram.webLink);
+		expect(document.body.textContent).not.toContain(en.telegram.transportWeb);
 		expect(textareas()).toEqual([fakeTls.tg, fakeTls.web]);
 	});
 

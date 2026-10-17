@@ -85,7 +85,8 @@
      between them. They are not: the listen port is the socket, the public port
      is what goes into the link, and they differ only behind a reverse proxy. -->
 <section class="group">
-	<h4 class="group-title">{$t('telegram.groupListen')}</h4>
+	<h4 class="group-title">{$t('telegram.transportMtproto')}</h4>
+	<p class="group-note">{$t('telegram.groupMtprotoNote')}</p>
 	<div class="field-grid">
 		<!-- A row, not a field: `field` would fight this element's own grid, and
 		     which display wins would come down to stylesheet order. -->
@@ -129,13 +130,6 @@
 			<input id="mt-domain" type="text" bind:value={form.masking_domain} placeholder="storage.googleapis.com" />
 			<span class="hint">{$t('telegram.maskingDomainHint')}</span>
 		</div>
-	</div>
-</section>
-
-<section class="group">
-	<h4 class="group-title">{$t('telegram.groupLinks')}</h4>
-	<p class="group-note">{$t('telegram.groupLinksNote')}</p>
-	<div class="field-grid">
 		<div class="field">
 			<label for="mt-host">{$t('telegram.publicHost')}</label>
 			<input id="mt-host" type="text" bind:value={form.public_host} />
@@ -160,7 +154,53 @@
 </section>
 
 <section class="group">
-	<h4 class="group-title">{$t('telegram.groupBehaviour')}</h4>
+	<h4 class="group-title">{$t('telegram.groupWeb')}</h4>
+	<div class="field-grid">
+		<div class="field wide">
+			<label class="check" for="mt-web-enabled">
+				<input id="mt-web-enabled" type="checkbox" bind:checked={form.web_enabled} />
+				{$t('telegram.webEnabled')}
+			</label>
+			<span class="hint">{$t('telegram.webEnabledHint')}</span>
+		</div>
+		{#if web.managed}
+			<p class="group-note wide">{$t('telegram.webManagedNote', { values: { domain: web.hostname } })}</p>
+		{:else}
+			<div class="field">
+				<label for="mt-web-host">{$t('telegram.webHostname')}</label>
+				<input id="mt-web-host" type="text" bind:value={form.web_hostname} placeholder="proxy.example.com" />
+				<span class="hint">{$t('telegram.webHostnameHint')}</span>
+			</div>
+			<div class="field">
+				<label for="mt-web-listen">{$t('telegram.webListen')}</label>
+				<input id="mt-web-listen" type="text" bind:value={form.web_listen} placeholder="127.0.0.1:9446" />
+				<span class="hint">{$t('telegram.webListenHint')}</span>
+			</div>
+			<div class="field wide">
+				<label for="mt-web-dir">{$t('telegram.webPublicDir')}</label>
+				<input id="mt-web-dir" type="text" bind:value={form.web_public_dir} />
+				<span class="hint">{$t('telegram.webPublicDirHint')}</span>
+			</div>
+		{/if}
+	</div>
+	{#if !web.managed}
+		<details class="snippets">
+			<summary>{$t('telegram.webSnippetTitle')}</summary>
+			<div class="field">
+				<label for="mt-web-nginx">{$t('telegram.webSnippetNginx')}</label>
+				<textarea id="mt-web-nginx" class="snippet" rows="14" readonly value={nginxSnippet(snippetHost, snippetListen)}></textarea>
+			</div>
+			<div class="field">
+				<label for="mt-web-caddy">{$t('telegram.webSnippetCaddy')}</label>
+				<textarea id="mt-web-caddy" class="snippet" rows="3" readonly value={caddySnippet(snippetHost, snippetListen)}></textarea>
+			</div>
+		</details>
+	{/if}
+</section>
+
+<section class="group">
+	<h4 class="group-title">{$t('telegram.groupShared')}</h4>
+	<p class="group-note">{$t('telegram.groupSharedNote')}</p>
 	<div class="field-grid">
 		<div class="field">
 			<label for="mt-conc">{$t('telegram.concurrency')}</label>
@@ -222,51 +262,6 @@
 			</div>
 		{/if}
 	</div>
-</section>
-
-<section class="group">
-	<h4 class="group-title">{$t('telegram.groupWeb')}</h4>
-	<div class="field-grid">
-		<div class="field wide">
-			<label class="check" for="mt-web-enabled">
-				<input id="mt-web-enabled" type="checkbox" bind:checked={form.web_enabled} />
-				{$t('telegram.webEnabled')}
-			</label>
-			<span class="hint">{$t('telegram.webEnabledHint')}</span>
-		</div>
-		{#if web.managed}
-			<p class="group-note wide">{$t('telegram.webManagedNote', { values: { domain: web.hostname } })}</p>
-		{:else}
-			<div class="field">
-				<label for="mt-web-host">{$t('telegram.webHostname')}</label>
-				<input id="mt-web-host" type="text" bind:value={form.web_hostname} placeholder="proxy.example.com" />
-				<span class="hint">{$t('telegram.webHostnameHint')}</span>
-			</div>
-			<div class="field">
-				<label for="mt-web-listen">{$t('telegram.webListen')}</label>
-				<input id="mt-web-listen" type="text" bind:value={form.web_listen} placeholder="127.0.0.1:9446" />
-				<span class="hint">{$t('telegram.webListenHint')}</span>
-			</div>
-			<div class="field wide">
-				<label for="mt-web-dir">{$t('telegram.webPublicDir')}</label>
-				<input id="mt-web-dir" type="text" bind:value={form.web_public_dir} />
-				<span class="hint">{$t('telegram.webPublicDirHint')}</span>
-			</div>
-		{/if}
-	</div>
-	{#if !web.managed}
-		<details class="snippets">
-			<summary>{$t('telegram.webSnippetTitle')}</summary>
-			<div class="field">
-				<label for="mt-web-nginx">{$t('telegram.webSnippetNginx')}</label>
-				<textarea id="mt-web-nginx" class="snippet" rows="14" readonly value={nginxSnippet(snippetHost, snippetListen)}></textarea>
-			</div>
-			<div class="field">
-				<label for="mt-web-caddy">{$t('telegram.webSnippetCaddy')}</label>
-				<textarea id="mt-web-caddy" class="snippet" rows="3" readonly value={caddySnippet(snippetHost, snippetListen)}></textarea>
-			</div>
-		</details>
-	{/if}
 </section>
 
 {#if missingOutbound}
