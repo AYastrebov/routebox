@@ -1165,12 +1165,21 @@ func (m *Manager) Update(updates map[string]interface{}) error {
 			if !ok {
 				return fmt.Errorf("setting %s: value must be a string", key)
 			}
-			_, portStr, err := net.SplitHostPort(v)
+			host, portStr, err := net.SplitHostPort(v)
 			if err != nil {
 				return fmt.Errorf("setting %s: must be host:port: %w", key, err)
 			}
 			if port, err := strconv.Atoi(portStr); err != nil || port < 1 || port > 65535 {
 				return fmt.Errorf("setting %s: port must be a number between 1 and 65535", key)
+			}
+			// A bootstrapped install's Caddyfile dials the front at
+			// 127.0.0.1:<port> whatever host this names, so a front bound
+			// anywhere else would be one dest cannot reach. Only a change is
+			// checked, so an older file that says otherwise still loads and
+			// can be rolled back to.
+			if staged.Server.Bootstrapped && v != staged.Mtproto.WebListen &&
+				host != "" && host != "127.0.0.1" && host != "0.0.0.0" {
+				return fmt.Errorf("setting %s: on an all-in-one install dest reaches the web front at 127.0.0.1:%s, so the host must be 127.0.0.1 (or empty or 0.0.0.0, which include it), not %q", key, portStr, host)
 			}
 			staged.Mtproto.WebListen = v
 		case "mtproto.web_public_dir":

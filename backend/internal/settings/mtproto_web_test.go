@@ -2,6 +2,7 @@ package settings
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -84,6 +85,34 @@ func TestMtprotoWebListenIsValidated(t *testing.T) {
 		if err := m.Update(map[string]any{"mtproto.web_listen": good}); err != nil {
 			t.Errorf("%q rejected: %v", good, err)
 		}
+	}
+}
+
+// A bootstrapped install's Caddyfile dials the front at 127.0.0.1:<port>, so
+// a front bound to any other host there would be one dest cannot reach.
+func TestMtprotoWebListenOnABootstrappedInstallMustIncludeLoopback(t *testing.T) {
+	m := mtprotoManager(t)
+	if err := m.SetBootstrap("/panel-secret", "127.0.0.1:9443", "", 443); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{"10.0.0.5:9446", "[::1]:9446", "localhost:9446", "127.0.0.2:9446"} {
+		err := m.Update(map[string]any{"mtproto.web_listen": bad})
+		if err == nil || !strings.Contains(err.Error(), "127.0.0.1") {
+			t.Errorf("%q: err = %v, want a refusal naming 127.0.0.1", bad, err)
+		}
+	}
+	for _, good := range []string{"127.0.0.1:9500", ":9501", "0.0.0.0:9502"} {
+		if err := m.Update(map[string]any{"mtproto.web_listen": good}); err != nil {
+			t.Errorf("%q rejected: %v", good, err)
+		}
+	}
+
+	// Only a change is checked: an older file that names another host still
+	// loads, and a rollback to that value still goes through.
+	m.settings.Mtproto.WebListen = "[::1]:9446"
+	if err := m.Update(map[string]any{"mtproto.web_listen": "[::1]:9446"}); err != nil {
+		t.Errorf("the unchanged value was refused: %v", err)
 	}
 }
 
