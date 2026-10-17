@@ -22,7 +22,7 @@ const shutdownTimeout = 15 * time.Second
 // Telegram WEB proxy can come and go without touching the listener. All
 // methods are safe for concurrent use.
 type Front struct {
-	stub http.Handler
+	stub atomic.Pointer[http.Handler]
 	web  atomic.Pointer[http.Handler]
 
 	mu     sync.Mutex // guards the running listener and its address
@@ -40,7 +40,17 @@ type running struct {
 
 // New returns a stopped front that serves stub until a web handler is set.
 func New(stub http.Handler) *Front {
-	return &Front{stub: stub}
+	f := &Front{}
+	f.stub.Store(&stub)
+	return f
+}
+
+// SetStub replaces the site served while no web handler is set. Like the web
+// handler it is read per request, so a stub pointed at a new directory takes
+// effect at once — without it a moved web_public_dir would keep serving the
+// old directory until the next restart.
+func (f *Front) SetStub(h http.Handler) {
+	f.stub.Store(&h)
 }
 
 // SetWebHandler makes h answer every request; nil reverts to the stub.
@@ -63,7 +73,7 @@ func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f.stub.ServeHTTP(w, r)
+	(*f.stub.Load()).ServeHTTP(w, r)
 }
 
 // Listen returns the configured address, or "" when not running.

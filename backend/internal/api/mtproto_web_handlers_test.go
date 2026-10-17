@@ -3,11 +3,15 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"routebox/backend/internal/mtproto"
 )
@@ -193,6 +197,60 @@ func TestUpdateWebListenBusyPortFails(t *testing.T) {
 	if h.webFront.Listen() != first || !answers(first) {
 		t.Error("the old listener stopped serving after a failed rebind")
 	}
+}
+
+// Off a bootstrapped install web_public_dir is the stub the front serves while
+// no WEB handler is set; moving it must show at once, not after a restart.
+func TestUpdateWebPublicDirSwapsTheFrontsStub(t *testing.T) {
+	_, r := newMtprotoTestHandler(t)
+
+	site := func(body string) string {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		return dir
+	}
+	first, second := site("first site"), site("second site")
+
+	addr := freeAddr(t)
+	if rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto",
+		`{"web_enabled":true,"web_hostname":"proxy.example.com","web_listen":"`+addr+`","web_public_dir":"`+first+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("enable: status = %d, body = %s", rec.Code, rec.Body)
+	}
+
+	if got := frontBody(t, addr); got != "first site" {
+		t.Fatalf("front serves %q, want the first site", got)
+	}
+
+	if rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"web_public_dir":"`+second+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("move the site: status = %d, body = %s", rec.Code, rec.Body)
+	}
+
+	if got := frontBody(t, addr); got != "second site" {
+		t.Errorf("front serves %q after web_public_dir moved, want the second site", got)
+	}
+}
+
+// frontBody fetches addr's root over a fresh connection.
+func frontBody(t *testing.T, addr string) string {
+	t.Helper()
+
+	c := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: 3 * time.Second}
+
+	resp, err := c.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET %s: %v", addr, err)
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(b)
 }
 
 func TestUpdateRejectsABadWebHostname(t *testing.T) {

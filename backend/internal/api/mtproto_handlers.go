@@ -552,6 +552,15 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Off a bootstrapped install the front's stub IS web_public_dir (what
+	// strangers get while the WEB proxy is off), so a new directory has to
+	// reach it now — not on the next restart. A bootstrapped install's stub
+	// is dest's stub root, which this setting does not move.
+	if current := h.settings.Get(); h.webFront != nil && !current.Server.Bootstrapped &&
+		current.Mtproto.WebPublicDir != previous.WebPublicDir {
+		h.webFront.SetStub(webfront.NewStub(current.Mtproto.WebPublicDir))
+	}
+
 	if err := h.settings.Save(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 

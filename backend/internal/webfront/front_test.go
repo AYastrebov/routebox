@@ -80,6 +80,20 @@ func TestFrontServesTheStubUntilAHandlerIsSet(t *testing.T) {
 	mustGet(t, addr, "web")
 }
 
+// The stub is what answers whenever the WEB proxy is off, so a new one has to
+// take effect without waiting for a web handler to come and go.
+func TestSetStubTakesEffectWithoutAWebHandler(t *testing.T) {
+	f, addr := startFront(t, textHandler("old stub"))
+	mustGet(t, addr, "old stub")
+	f.SetStub(textHandler("new stub"))
+	mustGet(t, addr, "new stub")
+	// A web handler still wins over it, and reverting lands on the new stub.
+	f.SetWebHandler(textHandler("web"))
+	mustGet(t, addr, "web")
+	f.SetWebHandler(nil)
+	mustGet(t, addr, "new stub")
+}
+
 func TestSetWebHandlerSwapsAndNilReverts(t *testing.T) {
 	f, addr := startFront(t, textHandler("stub"))
 
