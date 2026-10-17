@@ -156,20 +156,20 @@ func TestWebProxyLinksRejectAMalformedKey(t *testing.T) {
 
 func TestCanIssueWebLink(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		hostname string
-		enabled  bool
-		running  bool
-		want     bool
+		name      string
+		hostname  string
+		serving   bool
+		listening bool
+		want      bool
 	}{
 		{"no hostname", "", true, true, false},
 		{"hostname the handler refuses", "1.2.3.4", true, true, false},
-		{"disabled", "h", false, true, false},
-		{"not running", "h", true, false, false},
+		{"no WEB handler serving", "h", false, true, false},
+		{"front not listening", "h", true, false, false},
 		{"all set", "h", true, true, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := CanIssueWebLink(tt.hostname, tt.enabled, tt.running); got != tt.want {
+			if got := CanIssueWebLink(tt.hostname, tt.serving, tt.listening); got != tt.want {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})

@@ -444,7 +444,7 @@ func (h *Handler) GetMtprotoStatus(w http.ResponseWriter, r *http.Request) {
 			"hostname":       webHostname,
 			"listen":         mt.WebListen,
 			"public_dir":     mt.WebPublicDir,
-			"can_issue_link": mtproto.CanIssueWebLink(webHostname, mt.WebEnabled, status.Running),
+			"can_issue_link": mtproto.CanIssueWebLink(webHostname, status.Web.Enabled, h.webFrontListening()),
 			"sessions":       status.Web.Sessions,
 			"streams":        status.Web.Streams,
 		},
@@ -476,19 +476,14 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	allowed := map[string]bool{
-		"listen": true, "masking_domain": true, "public_host": true,
-		"public_port": true, "concurrency": true, "idle_timeout_sec": true,
-		"prefer_ip": true, "domain_fronting_port": true,
-		"outbound": true, "socks_port": true,
-		"web_enabled": true, "web_hostname": true, "web_listen": true,
-		"web_public_dir": true,
-	}
+	// The keys a failed save knows how to put back are the keys a save may
+	// carry: one list, so the two cannot drift apart.
+	allowed := mtprotoSettingValues(settings.MtprotoSettings{})
 
 	updates := map[string]any{}
 
 	for key, value := range body {
-		if !allowed[key] {
+		if _, ok := allowed["mtproto."+key]; !ok {
 			// enabled is deliberately excluded: it is owned by
 			// /enable and /disable, which also start and stop the listener.
 			writeError(w, http.StatusBadRequest, "unknown setting: "+key)
@@ -548,13 +543,20 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 	// what is actually running — persisting first and discovering the collision
 	// second would leave the proxy pointed at a listener that was never created.
 	if err := h.syncMtprotoSocks(); err != nil {
-		// Nothing has reached disk yet, so undoing the in-memory commit is all
-		// it takes to leave the panel and the config agreeing again.
-		if rollback := h.settings.Update(map[string]any{
-			"mtproto.outbound":   previous.Outbound,
-			"mtproto.socks_port": previous.SocksPort,
-		}); rollback != nil {
-			log.Printf("mtproto: cannot roll back the routing settings: %v", rollback)
+		// Nothing has reached disk yet, and nothing past this point has run,
+		// so undoing the in-memory commit of every key this PUT carried is all
+		// it takes to leave the panel and the config agreeing again. Every
+		// key, not just the routing ones: a web_listen left committed here
+		// would be written by the next save of anything, and reach the front
+		// on the one after, without this PUT ever having succeeded.
+		previousValues := mtprotoSettingValues(previous)
+		restore := make(map[string]any, len(updates))
+		for key := range updates {
+			restore[key] = previousValues[key]
+		}
+
+		if rollback := h.settings.Update(restore); rollback != nil {
+			log.Printf("mtproto: cannot roll back the settings: %v", rollback)
 		}
 
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -648,6 +650,13 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 // moved) onto web_listen; switched off, it is stopped. Rebind binds the new
 // address before letting go of the old one, so a failure here leaves the
 // previous listener serving.
+//
+// A front that is merely down — its bind failed at boot — is retried by any
+// save, but only a save that asked for the front (a new web_listen, WEB
+// switched on) fails over that retry. One that changed something else, a
+// public port say, has nothing to undo about the front and is not blocked by
+// a port the operator has not freed yet: the failure is logged and the save
+// goes on.
 func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) {
 	if h.webFront == nil {
 		return false, nil
@@ -656,9 +665,6 @@ func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) 
 	all := h.settings.Get()
 	current := all.Mtproto
 	listenChanged := current.WebListen != previous.WebListen
-	// A front that should be up and is not — its bind failed at boot — is
-	// retried by any save, so the operator is not left restarting the whole
-	// server to get it back once the port is free.
 	down := h.webFront.Listen() == ""
 
 	if all.Server.Bootstrapped {
@@ -667,6 +673,12 @@ func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) 
 		}
 
 		if err := h.webFront.Rebind(current.WebListen); err != nil {
+			if !listenChanged {
+				log.Printf("mtproto: WARNING the web front is still down, cannot listen on %s (mtproto.web_listen): %v", current.WebListen, err)
+
+				return false, nil
+			}
+
 			return false, fmt.Errorf("cannot move the web front to %s (mtproto.web_listen): %w", current.WebListen, err)
 		}
 
@@ -677,6 +689,12 @@ func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) 
 
 	switch {
 	case previous.WebEnabled && !current.WebEnabled:
+		// The handler goes first. A front stopped while it still hands
+		// requests to the handler waits for every parked long poll in it, up
+		// to its whole 15 s drain; a detached handler has already let them
+		// go. The Reconfigure that ends the PUT would have dropped WEB anyway.
+		h.mtproto.DetachWeb()
+
 		if err := h.webFront.Stop(); err != nil {
 			return false, fmt.Errorf("cannot stop the web front: %w", err)
 		}
@@ -687,6 +705,12 @@ func (h *Handler) syncWebFront(previous settings.MtprotoSettings) (bool, error) 
 		// already serves, so "switched on", "moved" and "came back" all land
 		// here.
 		if err := h.webFront.Rebind(current.WebListen); err != nil {
+			if previous.WebEnabled && !listenChanged {
+				log.Printf("mtproto: WARNING the web front is still down, cannot listen on %s (mtproto.web_listen): %v", current.WebListen, err)
+
+				return false, nil
+			}
+
 			return false, fmt.Errorf("cannot start the web front on %s: %w", current.WebListen, err)
 		}
 	}
@@ -709,6 +733,36 @@ func (h *Handler) restoreWebFront(listen string) {
 
 	if err := h.webFront.Rebind(listen); err != nil {
 		log.Printf("mtproto: cannot move the web front back to %s after a failed re-plan: %v", listen, err)
+	}
+}
+
+// webFrontListening reports whether the loopback front is up to hand the WEB
+// handler its requests. A handler can be serving behind a front whose bind
+// failed at boot, and a link to it would reach nothing.
+func (h *Handler) webFrontListening() bool {
+	return h.webFront != nil && h.webFront.Listen() != ""
+}
+
+// mtprotoSettingValues maps every key UpdateMtprotoSettings accepts to its
+// value in s, in the form settings.Update takes, so a failed save can put back
+// exactly the keys it committed. It is also the PUT's allow-list, so a key the
+// rollback does not know cannot be saved in the first place.
+func mtprotoSettingValues(s settings.MtprotoSettings) map[string]any {
+	return map[string]any{
+		"mtproto.listen":               s.Listen,
+		"mtproto.masking_domain":       s.MaskingDomain,
+		"mtproto.public_host":          s.PublicHost,
+		"mtproto.public_port":          s.PublicPort,
+		"mtproto.concurrency":          s.Concurrency,
+		"mtproto.idle_timeout_sec":     s.IdleTimeoutSec,
+		"mtproto.prefer_ip":            s.PreferIP,
+		"mtproto.domain_fronting_port": s.DomainFrontingPort,
+		"mtproto.outbound":             s.Outbound,
+		"mtproto.socks_port":           s.SocksPort,
+		"mtproto.web_enabled":          s.WebEnabled,
+		"mtproto.web_hostname":         s.WebHostname,
+		"mtproto.web_listen":           s.WebListen,
+		"mtproto.web_public_dir":       s.WebPublicDir,
 	}
 }
 
@@ -800,7 +854,7 @@ func (h *Handler) GetMtprotoClientLink(w http.ResponseWriter, r *http.Request) {
 	webHostname := all.EffectiveWebHostname()
 
 	canFakeTLS := mtproto.CanIssueLink(domain, host)
-	canWeb := mtproto.CanIssueWebLink(webHostname, all.Mtproto.WebEnabled, h.mtproto.Status().Running)
+	canWeb := mtproto.CanIssueWebLink(webHostname, h.mtproto.Status().Web.Enabled, h.webFrontListening())
 
 	if !canFakeTLS && !canWeb {
 		// A link built from a missing piece is well-formed and fails silently

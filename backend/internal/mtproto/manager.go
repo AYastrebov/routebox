@@ -366,22 +366,7 @@ func (m *Manager) stopLocked() error {
 	// the proxy, and the front must stop sending it requests first. Reverting
 	// the front hands strangers the stub site while the handler drains, and
 	// the drain is bounded so a stuck stream cannot hold Stop forever.
-	if m.web != nil {
-		if m.front != nil {
-			m.front.SetWebHandler(nil)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), web.DefaultTimeouts().Shutdown)
-		// Logged, not returned: the proxy below still has to stop, and a drain
-		// that ran out of time only means some WEB sessions were cut short.
-		if err := m.web.Shutdown(ctx); err != nil {
-			log.Printf("mtproto: WEB proxy shutdown: %v", err)
-		}
-
-		cancel()
-
-		m.web = nil
-	}
+	m.detachWebLocked()
 
 	m.proxy.Shutdown()
 
@@ -391,6 +376,47 @@ func (m *Manager) stopLocked() error {
 	m.clients = 0
 
 	return err
+}
+
+// detachWebLocked reverts the front to the stub and drains the WEB handler,
+// if there is one. Closing its sessions releases every parked long poll, so
+// the requests the front is holding for it end at once rather than when their
+// poll runs out.
+func (m *Manager) detachWebLocked() {
+	if m.web == nil {
+		return
+	}
+
+	if m.front != nil {
+		m.front.SetWebHandler(nil)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), web.DefaultTimeouts().Shutdown)
+	// Logged, not returned: the proxy still has to stop, and a drain that ran
+	// out of time only means some WEB sessions were cut short.
+	if err := m.web.Shutdown(ctx); err != nil {
+		log.Printf("mtproto: WEB proxy shutdown: %v", err)
+	}
+
+	cancel()
+
+	m.web = nil
+}
+
+// DetachWeb stops serving the WEB proxy on a running proxy and leaves Fake TLS
+// up; a no-op when there is no WEB handler. It exists for the front's sake:
+// stopping a front that still hands requests to the handler waits for every
+// parked long poll in it, up to the front's whole drain timeout, while a
+// detached handler has already released them.
+//
+// The saved config forgets WEB too, so a Rebuild in the meantime does not
+// bring it back; the next Start or Reconfigure decides whether it returns.
+func (m *Manager) DetachWeb() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.detachWebLocked()
+	m.cfg.Web = nil
 }
 
 // Rebuild reapplies the roster to a running proxy, and is a no-op when stopped.

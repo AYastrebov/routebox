@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,12 +10,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/9seconds/mtg/v2/mtglib"
+	"github.com/9seconds/mtg/v2/mtglib/web"
+
 	"routebox/backend/internal/mtproto"
+	"routebox/backend/internal/webfront"
 )
 
 // freeAddr returns a loopback address nothing is listening on right now.
@@ -628,4 +635,242 @@ func TestMtprotoConfigSkipsWebOnAHostnameTheHandlerRefuses(t *testing.T) {
 	if cfg := h.MtprotoConfig(); cfg.Web == nil || cfg.Web.Hostname != "media.example.com" {
 		t.Errorf("Web = %+v, want it on the lowercased public host", cfg.Web)
 	}
+}
+
+// A SOCKS sync that fails leaves nothing of the PUT behind, the web_* keys
+// included: they were committed in memory with the rest, and a web_listen left
+// there would be written by the next save of anything.
+func TestUpdateRollsBackEveryKeyWhenTheRoutingCannotBeWritten(t *testing.T) {
+	h, r, _ := newMtprotoRoutingHandler(t)
+
+	front := webfront.New(webfront.NewStub(t.TempDir()))
+	running := freeAddr(t)
+	if err := front.Start(running); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = front.Stop() })
+	h.SetWebFront(front)
+
+	// Occupy the port the Telegram proxy is about to ask for.
+	if err := h.config.CreateInbound(map[string]interface{}{
+		"type": "socks", "tag": "local-socks", "listen": "127.0.0.1", "listen_port": float64(1080),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.config.ApplyDraft(); err != nil {
+		t.Fatal(err)
+	}
+
+	before := h.settings.Get().Mtproto
+
+	rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto/",
+		`{"outbound":"warp","web_enabled":true,"web_hostname":"proxy.example.com","web_listen":"`+freeAddr(t)+`","public_port":8443}`)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "1080") {
+		t.Fatalf("status = %d, body = %s; want 500 naming the colliding port", rec.Code, rec.Body)
+	}
+
+	if got := h.settings.Get().Mtproto; got != before {
+		t.Errorf("settings after a failed save = %+v, want them unchanged: %+v", got, before)
+	}
+
+	if front.Listen() != running {
+		t.Errorf("front = %q, want it untouched on %q", front.Listen(), running)
+	}
+}
+
+// A WEB link is offered only while a handler is serving behind a front that
+// listens: the setting alone, or a proxy running with its front down, hands
+// out a link that reaches nothing.
+func TestWebLinkNeedsAServingHandlerBehindAListeningFront(t *testing.T) {
+	h, r := webLinkInstall(t, true)
+
+	if !getWebBlock(t, r).CanIssueLink {
+		t.Fatal("can_issue_link = false with the WEB proxy serving")
+	}
+
+	// What a busy port at boot leaves: the handler is up, the front is not.
+	if err := h.webFront.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if getWebBlock(t, r).CanIssueLink {
+		t.Error("can_issue_link = true with the front down")
+	}
+
+	var body map[string]json.RawMessage
+
+	decodeMtprotoData(t, mtprotoReq(t, r, http.MethodGet, "/api/mtproto/clients/alice/link", ""), &body)
+
+	if string(body["webproxy"]) != "null" {
+		t.Errorf("webproxy = %s with the front down, want null", body["webproxy"])
+	}
+}
+
+func TestWebLinkNeedsTheHandlerNotJustTheSetting(t *testing.T) {
+	h, r := webLinkInstall(t, false)
+
+	// Switched on in the settings, but the running proxy was started without
+	// WEB and has not been reconfigured since.
+	if err := h.settings.Update(map[string]any{"mtproto.web_enabled": true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if getWebBlock(t, r).CanIssueLink {
+		t.Error("can_issue_link = true with no WEB handler serving")
+	}
+}
+
+// Switching WEB off must not wait out the front's 15 s drain on the handler's
+// parked long polls: the handler goes first and releases them.
+func TestUpdateWebDisabledReleasesParkedPollsAtOnce(t *testing.T) {
+	h, r := webLinkInstall(t, true)
+
+	base := "http://" + h.webFront.Listen()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	send := func(method, path, token string, body []byte) *http.Response {
+		t.Helper()
+
+		req, err := http.NewRequest(method, base+path, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Host = "proxy.example.com"
+		req.Header.Set("X-Forwarded-For", "203.0.113.9")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/octet-stream")
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+
+		return resp
+	}
+
+	var secret mtglib.Secret
+	raw, _ := hex.DecodeString(testSecret)
+	copy(secret.Key[:], raw)
+
+	resp := send(http.MethodGet, "/?bridge="+web.Capability(secret, "proxy.example.com"), "", nil)
+	page, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	m := regexp.MustCompile(`const BOOTSTRAP = "([A-Za-z0-9_-]{43})";`).FindSubmatch(page)
+	if m == nil {
+		t.Fatalf("no bootstrap token in the bridge page (status %d)", resp.StatusCode)
+	}
+
+	resp = send(http.MethodPost, "/api/v1/session", string(m[1]), web.EncodeFrame(web.FrameHello, 0, []byte{1}))
+	resp.Body.Close()
+
+	token := resp.Header.Get("X-Session-Token")
+	if resp.StatusCode != http.StatusOK || token == "" {
+		t.Fatalf("session: status %d, token %q", resp.StatusCode, token)
+	}
+
+	// A down poll with nothing to deliver parks for the handler's whole long
+	// poll, 25 s.
+	parked := make(chan struct{})
+	go func() {
+		defer close(parked)
+
+		req, _ := http.NewRequest(http.MethodPost, base+"/api/v1/down", nil)
+		req.Host = "proxy.example.com"
+		req.Header.Set("X-Forwarded-For", "203.0.113.9")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Down-Cursor", "0")
+
+		if resp, err := client.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	// Long enough for the poll to reach the handler and park.
+	time.Sleep(300 * time.Millisecond)
+
+	start := time.Now()
+
+	rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"web_enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable: status = %d, body = %s", rec.Code, rec.Body)
+	}
+
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("disable took %v, want it well under the front's 15 s drain", took)
+	}
+
+	if h.webFront.Listen() != "" {
+		t.Errorf("front = %q, want it stopped", h.webFront.Listen())
+	}
+
+	select {
+	case <-parked:
+	case <-time.After(3 * time.Second):
+		t.Error("the parked poll was not released")
+	}
+}
+
+// A save that did not ask for the front (no new web_listen, WEB not switched
+// on) is not failed by a down front's retry: the port is still busy, but the
+// public port the operator changed has nothing to do with it.
+func TestUpdateIsNotBlockedByADownFrontOnABusyPort(t *testing.T) {
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+
+	check := func(t *testing.T, h *Handler, r http.Handler) {
+		t.Helper()
+
+		if err := h.settings.Update(map[string]any{"mtproto.web_listen": busy.Addr().String()}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := h.webFront.Stop(); err != nil {
+			t.Fatal(err)
+		}
+
+		if rec := mtprotoReq(t, r, http.MethodPut, "/api/mtproto", `{"public_port":8443}`); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s; want 200", rec.Code, rec.Body)
+		}
+
+		if got := h.settings.Get().Mtproto; got.PublicPort != 8443 || got.WebListen != busy.Addr().String() {
+			t.Errorf("public_port = %d, web_listen = %q; want 8443 and the busy address kept", got.PublicPort, got.WebListen)
+		}
+
+		onDisk, err := os.ReadFile(h.settings.GetPath())
+		if err != nil || !strings.Contains(string(onDisk), "public_port = 8443") {
+			t.Errorf("the save did not reach disk (%v):\n%s", err, onDisk)
+		}
+
+		if h.webFront.Listen() != "" {
+			t.Errorf("front = %q, want it still down", h.webFront.Listen())
+		}
+	}
+
+	t.Run("WEB on", func(t *testing.T) {
+		h, r := newMtprotoTestHandler(t)
+		if err := h.settings.Update(map[string]any{"mtproto.web_enabled": true}); err != nil {
+			t.Fatal(err)
+		}
+
+		check(t, h, r)
+	})
+
+	t.Run("bootstrapped", func(t *testing.T) {
+		h, r, calls, _ := bootstrappedWebInstall(t)
+
+		check(t, h, r)
+
+		if *calls != 0 {
+			t.Errorf("replans = %d, want none for a front that is still down", *calls)
+		}
+	})
 }

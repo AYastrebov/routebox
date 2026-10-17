@@ -85,10 +85,13 @@ func WebProxyLinks(hostname, secretHex string) (tg, webLink string, err error) {
 }
 
 // CanIssueWebLink reports whether a WEB link is worth offering: it needs a
-// hostname the WEB handler accepts, the feature switched on and a proxy
-// actually serving it. Anything less yields a link that fails silently inside
+// hostname the WEB handler accepts, a WEB handler actually serving (the
+// running proxy's Status().Web.Enabled, not the setting: a proxy that is
+// stopped, or started with WEB skipped, serves none) and a front listening to
+// hand it requests. Anything less yields a link that fails silently inside
 // Telegram — a hostname the handler refuses means the proxy runs with WEB
-// skipped (see Handler.MtprotoConfig).
-func CanIssueWebLink(hostname string, enabled, running bool) bool {
-	return web.ValidateHostname(hostname) == nil && enabled && running
+// skipped (see Handler.MtprotoConfig), and a front whose bind failed at boot
+// leaves the handler with no way in.
+func CanIssueWebLink(hostname string, handlerServing, frontListening bool) bool {
+	return web.ValidateHostname(hostname) == nil && handlerServing && frontListening
 }
