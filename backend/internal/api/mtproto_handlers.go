@@ -598,12 +598,13 @@ func (h *Handler) UpdateMtprotoSettings(w http.ResponseWriter, r *http.Request) 
 			// Only a move is undone. A front that merely came back up on the
 			// address it always had is where dest already points, and taking
 			// it down again would help nobody.
-			if h.settings.Get().Mtproto.WebListen != previous.WebListen {
+			target := h.settings.Get().Mtproto.WebListen
+			if target != previous.WebListen {
 				h.restoreWebFront(frontBefore)
 			}
 			rollbackWeb()
 			writeError(w, http.StatusInternalServerError,
-				fmt.Sprintf("the web front cannot move: dest's Caddyfile could not be re-planned to follow it: %v", err))
+				fmt.Sprintf("dest's Caddyfile could not be re-planned to follow the web front on %s (mtproto.web_listen), so the change was undone: %v", target, err))
 
 			return
 		}
